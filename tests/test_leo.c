@@ -807,6 +807,83 @@ static void test_leo_respond_empty_prompt_falls_back(void) {
     PASS();
 }
 
+/* ================================================================
+ * LEOFIELD — physics of the inner state (AML-inspired)
+ * ================================================================ */
+
+static void test_leo_field_init_free(void) {
+    TEST("leo_field_init/free: clean lifecycle");
+    LeoField f;
+    leo_field_init(&f, 1024);
+    ASSERT(f.destiny_bag != NULL, "destiny_bag allocated");
+    ASSERT(f.destiny_cap == 1024, "cap set");
+    ASSERT(f.velocity_mode == LEO_VEL_WALK, "default walk");
+    ASSERT(f.pain == 0.0f && f.trauma == 0.0f, "pain starts at zero");
+    leo_field_free(&f);
+    ASSERT(f.destiny_bag == NULL, "freed");
+    PASS();
+}
+
+static void test_leo_field_step_builds_destiny(void) {
+    TEST("leo_field_step: destiny_bag accumulates emitted tokens");
+    LeoField f;
+    leo_field_init(&f, 512);
+    for (int i = 0; i < 5; i++) leo_field_step(&f, 42, 1.0f);
+    ASSERT(f.destiny_bag[42] > 0.0f, "token 42 sits in destiny");
+    ASSERT(f.destiny_bag[7] == 0.0f, "untouched token is zero");
+    leo_field_free(&f);
+    PASS();
+}
+
+static void test_leo_field_prophecy_add_and_fulfillment(void) {
+    TEST("leo_field_prophecy: add, age, fulfill");
+    LeoField f;
+    leo_field_init(&f, 512);
+    leo_field_prophecy_add(&f, 99, 0.8f);
+    int found_active = 0;
+    for (int i = 0; i < LEO_PROPHECY_MAX; i++)
+        if (f.prophecy[i].active && f.prophecy[i].target == 99)
+            found_active = 1;
+    ASSERT(found_active, "prophecy stored");
+    leo_field_step(&f, 99, 1.0f); /* fulfill */
+    int still_active = 0;
+    for (int i = 0; i < LEO_PROPHECY_MAX; i++)
+        if (f.prophecy[i].active && f.prophecy[i].target == 99)
+            still_active = 1;
+    ASSERT(!still_active, "fulfilled prophecy deactivated");
+    leo_field_free(&f);
+    PASS();
+}
+
+static void test_leo_field_trauma_pulls_bootstrap(void) {
+    TEST("leo_field_candidate_bias: trauma boosts bootstrap tokens");
+    LeoField f;
+    leo_field_init(&f, 512);
+    int boot[3] = {10, 20, 30};
+    leo_field_set_bootstrap(&f, boot, 3);
+    /* force trauma */
+    f.pain = 0.9f;
+    f.trauma = f.pain * f.pain;
+    float bias_on = leo_field_candidate_bias(&f, 20);
+    float bias_off = leo_field_candidate_bias(&f, 999);
+    ASSERT(bias_on > bias_off, "bootstrap token gets bigger bias under trauma");
+    leo_field_free(&f);
+    PASS();
+}
+
+static void test_leo_field_temp_mult_velocity_modes(void) {
+    TEST("leo_field_temperature_mult: modes shift base");
+    LeoField f;
+    leo_field_init(&f, 128);
+    f.velocity_mode = LEO_VEL_NOMOVE;
+    float a = leo_field_temperature_mult(&f);
+    f.velocity_mode = LEO_VEL_RUN;
+    float b = leo_field_temperature_mult(&f);
+    ASSERT(a < b, "NOMOVE cooler than RUN");
+    leo_field_free(&f);
+    PASS();
+}
+
 static void test_embedded_bootstrap_is_nonempty(void) {
     TEST("LEO_EMBEDDED_BOOTSTRAP: non-empty fallback origin text");
     ASSERT(LEO_EMBEDDED_BOOTSTRAP != NULL, "not null");
@@ -909,6 +986,11 @@ int main(void) {
     test_compute_prompt_gravity_nonempty();
     test_leo_respond_empty_prompt_falls_back();
     test_embedded_bootstrap_is_nonempty();
+    test_leo_field_init_free();
+    test_leo_field_step_builds_destiny();
+    test_leo_field_prophecy_add_and_fulfillment();
+    test_leo_field_trauma_pulls_bootstrap();
+    test_leo_field_temp_mult_velocity_modes();
     test_leo_respond_gravity_restored_after_call();
 
     /* SPA */

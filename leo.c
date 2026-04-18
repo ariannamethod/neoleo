@@ -60,6 +60,21 @@ static const char *LEO_EMBEDDED_BOOTSTRAP =
 #define LEO_BI_IDX_MAX    (128 * 1024) /* src → {dst,count} reverse index */
 #define LEO_BEST_OF_K     3
 
+/* ─── LeoField — physics of the field (AML-inspired, in C) ────────── */
+#define LEO_PROPHECY_MAX  16
+#define LEO_SCAR_MAX      32
+#define LEO_SCAR_BYTES    64
+
+#define LEO_VEL_NOMOVE    0
+#define LEO_VEL_WALK      1
+#define LEO_VEL_RUN       2
+#define LEO_VEL_BACKWARD (-1)
+
+#define LEO_FIELD_DECAY    0.995f
+#define LEO_DESTINY_ALPHA  0.08f
+#define LEO_PAIN_DECAY     0.985f
+#define LEO_DEBT_DECAY     0.998f
+
 #define LEO_GEN_MAX       256
 #define LEO_GEN_TARGET    20
 #define LEO_GEN_MIN       6
@@ -572,6 +587,58 @@ static int trigram_walk_ab(const TrigramTable *t, int a, int b,
  * LEO — the organism
  * ======================================================================== */
 
+/* ─── Prophecy: a prediction aging until fulfilled or dropped ─── */
+typedef struct {
+    int   target;
+    float strength;
+    int   age;
+    int   active;
+} LeoProphecy;
+
+/* ─── LeoField: the physics of Leo's inner state ──────────────────
+ *
+ * This is the C-native home for the AML-style live state. It is
+ * evolved once per generated token and once per ingested paragraph.
+ * It modulates temperature, biases candidate scores, tracks pending
+ * predictions, and carries trauma — the detector AND the effect
+ * live together, in the core. */
+typedef struct {
+    /* destiny — an EMA bag of recent tokens. Candidates that resonate
+     * with this bag get a gentle pull. No embeddings needed: the bag
+     * itself is a histogram over vocab, updated per emitted token. */
+    float *destiny_bag;            /* [vocab_cap] EMA weights, decays */
+    int    destiny_cap;            /* allocation size */
+
+    /* suffering — composite. pain grows from incoherent candidates
+     * (empty trigram rows, low coherence scores) and trauma triggers,
+     * decays each step. */
+    float pain;
+    float tension;
+    float debt;
+    float dissonance;
+
+    /* velocity / temperature */
+    int   velocity_mode;           /* NOMOVE / WALK / RUN / BACKWARD */
+    float velocity_mag;            /* 0..1 */
+
+    /* prophecies — active predictions pulling toward specific tokens */
+    LeoProphecy prophecy[LEO_PROPHECY_MAX];
+    int         n_prophecy;
+
+    /* scars — small strings that Leo has learned to associate with pain.
+     * When pain is high, gravity toward scar tokens increases. */
+    char scars[LEO_SCAR_MAX][LEO_SCAR_BYTES];
+    int  n_scars;
+
+    /* trauma level derived from pain (public for gravity boost) */
+    float trauma;
+
+    /* bootstrap origin tokens — set once, never mutated. Trauma pulls
+     * generation toward these when pain crosses threshold. */
+    int   *bootstrap_ids;
+    int    n_bootstrap;
+} LeoField;
+
 typedef struct {
     BPE          bpe;
     CoocField    cooc;
@@ -584,7 +651,168 @@ typedef struct {
      * leo_respond / leo_chain_respond. Leo speaks from his own field;
      * gravity only wrinkles the field toward the conversation's theme. */
     float       *gravity;
+
+    /* LeoField — the physics of the inner state, evolved per token. */
+    LeoField     field;
 } Leo;
+
+/* ========================================================================
+ * LEO FIELD — physics of the inner state
+ *
+ * destiny_bag:  EMA histogram over vocab. Recent emitted tokens sit in
+ *               this bag with a slow decay, giving candidates a "pull"
+ *               toward the current theme without needing embeddings.
+ *
+ * pain / tension / debt / dissonance:  AML-style composite suffering.
+ *               Pain grows from incoherent candidate rows (empty trigram
+ *               lookups, low coherence scores) and unfulfilled prophecy.
+ *               Trauma = pain², pulls gravity toward bootstrap tokens.
+ *
+ * velocity / velocity_mag:  temperature is movement. WALK = normal,
+ *               RUN = higher temp (chaos), NOMOVE = lower (observation),
+ *               BACKWARD = rewind with temporal debt.
+ *
+ * prophecy:     unfulfilled predictions accumulating debt through age.
+ *               Each active prophecy pulls a specific token candidate.
+ *
+ * bootstrap_ids:  the origin tokens. Set once (from ingested corpus or
+ *               from LEO_EMBEDDED_BOOTSTRAP). Trauma pulls toward these.
+ * ======================================================================== */
+
+static void leo_field_init(LeoField *f, int vocab_cap) {
+    memset(f, 0, sizeof(*f));
+    f->destiny_cap = vocab_cap > 0 ? vocab_cap : LEO_MAX_VOCAB;
+    f->destiny_bag = calloc(f->destiny_cap, sizeof(float));
+    f->velocity_mode = LEO_VEL_WALK;
+    f->velocity_mag = 0.5f;
+}
+
+static void leo_field_free(LeoField *f) {
+    free(f->destiny_bag); f->destiny_bag = NULL;
+    free(f->bootstrap_ids); f->bootstrap_ids = NULL;
+    memset(f, 0, sizeof(*f));
+}
+
+/* Set the origin anchor. Caller provides ids; we copy. */
+static void leo_field_set_bootstrap(LeoField *f, const int *ids, int n) {
+    free(f->bootstrap_ids);
+    if (n <= 0) { f->bootstrap_ids = NULL; f->n_bootstrap = 0; return; }
+    f->bootstrap_ids = malloc(n * sizeof(int));
+    memcpy(f->bootstrap_ids, ids, n * sizeof(int));
+    f->n_bootstrap = n;
+}
+
+/* Declare or refresh a prophecy. */
+static void leo_field_prophecy_add(LeoField *f, int target, float strength) {
+    if (target < 0) return;
+    for (int i = 0; i < LEO_PROPHECY_MAX; i++) {
+        if (f->prophecy[i].active && f->prophecy[i].target == target) {
+            if (strength > f->prophecy[i].strength)
+                f->prophecy[i].strength = strength;
+            f->prophecy[i].age = 0;
+            return;
+        }
+    }
+    for (int i = 0; i < LEO_PROPHECY_MAX; i++) {
+        if (!f->prophecy[i].active) {
+            f->prophecy[i].target = target;
+            f->prophecy[i].strength = strength;
+            f->prophecy[i].age = 0;
+            f->prophecy[i].active = 1;
+            if (i >= f->n_prophecy) f->n_prophecy = i + 1;
+            return;
+        }
+    }
+    int oldest = 0;
+    for (int i = 1; i < LEO_PROPHECY_MAX; i++)
+        if (f->prophecy[i].age > f->prophecy[oldest].age) oldest = i;
+    f->prophecy[oldest] = (LeoProphecy){ target, strength, 0, 1 };
+}
+
+/* One field step per emitted token.
+ *
+ *   coherence_hint < 0 means "unknown/unavailable" — we use it as a
+ *   proxy for how well the candidate cascade is performing. When the
+ *   trigram bucket is empty or the chosen candidate had a very thin
+ *   score field, the caller passes something small / negative to
+ *   signal incoherence; pain grows. */
+static void leo_field_step(LeoField *f, int emitted,
+                           float coherence_hint) {
+    /* decay destiny bag; age prophecies */
+    for (int i = 0; i < f->destiny_cap; i++)
+        f->destiny_bag[i] *= 1.0f - LEO_DESTINY_ALPHA;
+    if (emitted >= 0 && emitted < f->destiny_cap)
+        f->destiny_bag[emitted] += LEO_DESTINY_ALPHA * 10.0f;
+
+    float pain_signal = 0;
+    if (coherence_hint >= 0 && coherence_hint < 0.15f) {
+        pain_signal = 0.15f - coherence_hint;
+    }
+    f->pain = clampf(f->pain * LEO_PAIN_DECAY + 0.04f * pain_signal,
+                     0.0f, 1.0f);
+    f->tension = clampf(f->tension * 0.995f, 0.0f, 1.0f);
+    f->debt    = f->debt * LEO_DEBT_DECAY;
+    f->trauma  = f->pain * f->pain;
+
+    /* prophecy evolution */
+    for (int i = 0; i < LEO_PROPHECY_MAX; i++) {
+        if (!f->prophecy[i].active) continue;
+        f->prophecy[i].age++;
+        if (f->prophecy[i].target == emitted) {
+            f->prophecy[i].active = 0;           /* fulfilled */
+            f->debt = clampf(f->debt - 0.05f * f->prophecy[i].strength,
+                             0.0f, 1.0f);
+        } else if (f->prophecy[i].age > 24) {
+            f->prophecy[i].active = 0;           /* expired */
+            f->debt = clampf(f->debt + 0.02f, 0.0f, 1.0f);
+        }
+    }
+}
+
+/* Additive candidate bias from the field. Composed of:
+ *   destiny bag pull, active prophecy pull, trauma gravity toward
+ *   bootstrap tokens. Gravity (prompt wrinkle) is a separate channel
+ *   handled in CandCollector. */
+static float leo_field_candidate_bias(const LeoField *f, int candidate) {
+    if (!f || candidate < 0) return 0.0f;
+    float bias = 0.0f;
+    if (candidate < f->destiny_cap)
+        bias += 0.02f * f->destiny_bag[candidate];
+    for (int i = 0; i < LEO_PROPHECY_MAX; i++) {
+        if (!f->prophecy[i].active) continue;
+        if (f->prophecy[i].target == candidate) {
+            bias += 0.3f * f->prophecy[i].strength
+                  * logf(1.0f + (float)f->prophecy[i].age);
+            break;
+        }
+    }
+    if (f->trauma > 0.2f && f->bootstrap_ids) {
+        int cap = f->n_bootstrap < 256 ? f->n_bootstrap : 256;
+        for (int i = 0; i < cap; i++) {
+            if (f->bootstrap_ids[i] == candidate) {
+                bias += 0.5f * f->trauma;
+                break;
+            }
+        }
+    }
+    return bias;
+}
+
+/* Temperature multiplier from velocity + pain. Cold under trauma,
+ * livelier when running, flat at walk. */
+static float leo_field_temperature_mult(const LeoField *f) {
+    if (!f) return 1.0f;
+    float m = 1.0f;
+    switch (f->velocity_mode) {
+        case LEO_VEL_NOMOVE:   m = 0.55f; break;
+        case LEO_VEL_RUN:      m = 1.30f; break;
+        case LEO_VEL_BACKWARD: m = 0.80f; break;
+        case LEO_VEL_WALK:
+        default:               m = 1.00f; break;
+    }
+    m *= 1.0f - 0.3f * f->trauma;
+    return clampf(m, 0.3f, 2.0f);
+}
 
 void leo_init(Leo *leo) {
     memset(leo, 0, sizeof(*leo));
@@ -592,6 +820,7 @@ void leo_init(Leo *leo) {
     cooc_init(&leo->cooc, LEO_COOC_MAX, LEO_MAX_VOCAB);
     bigram_init(&leo->bigrams, LEO_BIGRAM_MAX);
     trigram_init(&leo->trigrams, LEO_TRIGRAM_MAX);
+    leo_field_init(&leo->field, LEO_MAX_VOCAB);
     leo->step = 0;
     srand((unsigned)time(NULL));
 }
@@ -600,6 +829,7 @@ void leo_free(Leo *leo) {
     cooc_free(&leo->cooc);
     bigram_free(&leo->bigrams);
     trigram_free(&leo->trigrams);
+    leo_field_free(&leo->field);
 }
 
 /* Ingest a block of human text. This is how Leo hears. */
@@ -817,6 +1047,11 @@ int leo_choose_start(const Leo *leo) {
  * O(N_trigram_entries). */
 #define LEO_MAX_CANDS 256
 
+/* forward decls — field functions are defined later, near leo_init */
+static float leo_field_candidate_bias(const LeoField *f, int candidate);
+static float leo_field_temperature_mult(const LeoField *f);
+static void  leo_field_step(LeoField *f, int emitted, float coherence_hint);
+
 typedef struct {
     int   *id;
     float *sc;
@@ -825,6 +1060,7 @@ typedef struct {
     int    prev1;
     const CoocField *cooc;
     const float     *gravity;  /* optional multiplicative boost per token */
+    const LeoField  *field;    /* optional additive bias per candidate */
 } CandCollector;
 
 typedef CandCollector CandCollector2; /* transitional alias */
@@ -835,6 +1071,7 @@ static int cand_collect_tri(int c, float count, void *ud) {
     float s = cooc_get(cc->cooc, cc->prev1, c);
     float score = 0.7f * count + 0.3f * s;
     if (cc->gravity) score *= 1.0f + 0.5f * cc->gravity[c];
+    if (cc->field)   score += leo_field_candidate_bias(cc->field, c);
     cc->id[cc->n] = c;
     cc->sc[cc->n] = score;
     cc->n++;
@@ -846,6 +1083,7 @@ static int cand_collect_bi(int dst, float count, void *ud) {
     if (cc->n >= cc->max) return 1;
     float score = count;
     if (cc->gravity) score *= 1.0f + 0.5f * cc->gravity[dst];
+    if (cc->field)   score += leo_field_candidate_bias(cc->field, dst);
     cc->id[cc->n] = dst;
     cc->sc[cc->n] = score;
     cc->n++;
@@ -860,7 +1098,7 @@ int leo_step_token(const Leo *leo, int prev2, int prev1, float temp) {
     int   cand_id[LEO_MAX_CANDS];
     float cand_sc[LEO_MAX_CANDS];
     CandCollector cc = { cand_id, cand_sc, 0, LEO_MAX_CANDS,
-                         prev1, &leo->cooc, leo->gravity };
+                         prev1, &leo->cooc, leo->gravity, &leo->field };
 
     if (prev2 >= 0)
         trigram_walk_ab(&leo->trigrams, prev2, prev1, cand_collect_tri, &cc);
@@ -926,9 +1164,14 @@ int leo_generate_ex(Leo *leo, char *out, int max_len,
     for (int t = 1; t < LEO_GEN_MAX; t++) {
         int prev1 = ctx[n - 1];
         int prev2 = n >= 2 ? ctx[n - 2] : -1;
-        float tau = temp_for_step(t);
+        float tau = temp_for_step(t) * leo_field_temperature_mult(&leo->field);
         int nxt = leo_step_token(leo, prev2, prev1, tau);
         if (nxt < 0) break;
+
+        /* field evolves once per emitted token; coherence_hint uses
+         * a simple proxy (did we find any trigram/bigram candidate?) —
+         * when prev1 has no successors, pain grows toward bootstrap. */
+        leo_field_step(&leo->field, nxt, nxt >= 0 ? 1.0f : 0.0f);
 
         /* light repetition guard: kill immediate and back-to-back repeats */
         if (nxt == prev1) continue;
@@ -1404,6 +1647,16 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[ingest] (no %s — falling back to embedded bootstrap)\n",
                 corpus);
         leo_ingest(&leo, LEO_EMBEDDED_BOOTSTRAP);
+    }
+
+    /* anchor the origin — trauma will pull toward these when pain rises. */
+    {
+        int boot_ids[1024];
+        int boot_n = bpe_encode(&leo.bpe,
+                                (const uint8_t *)LEO_EMBEDDED_BOOTSTRAP,
+                                (int)strlen(LEO_EMBEDDED_BOOTSTRAP),
+                                boot_ids, 1024);
+        leo_field_set_bootstrap(&leo.field, boot_ids, boot_n);
     }
 
     if (one_prompt) {

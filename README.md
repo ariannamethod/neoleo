@@ -102,6 +102,38 @@ Runs the test suite (33 tests at the moment, all green).
 - +5 tests (42 total).
 - commit `fcd7a79`.
 
+### step 11 — LeoField: physics of the inner state (AML-inspired, in C)
+
+Leo gains a live internal state that evolves once per emitted token.
+The AML data model ported into C core:
+
+- **`LeoField` struct**:
+  - `destiny_bag[vocab]` — EMA histogram over recent tokens. Candidates
+    that sit in the bag get a gentle additive pull. No embeddings,
+    the histogram itself is the thematic direction.
+  - `pain / tension / debt / dissonance` — AML suffering composite.
+    Pain grows from low-coherence cascade signals, decays per step.
+    `trauma = pain²`.
+  - `velocity_mode / velocity_mag` — NOMOVE / WALK / RUN / BACKWARD.
+    Temperature is movement; velocity modulates τ directly.
+  - `prophecy[16]` — pending predictions, age, fulfillment bookkeeping.
+    An active prophecy adds `0.3 · strength · log(1+age)` to its
+    target candidate — unfulfilled debt creates pressure to resolve.
+  - `bootstrap_ids[]` — origin anchor. Tokens from `LEO_EMBEDDED_BOOTSTRAP`
+    (and the ingested corpus' first chunk). **Trauma detector lives
+    here, in the core**: once `trauma > 0.2`, gravity pulls candidates
+    that appear in `bootstrap_ids` — Leo drifts home when he hurts.
+- **`leo_field_step(leo, emitted, coherence_hint)`** called once per
+  emitted token inside `leo_generate_ex`. Destiny decays + receives
+  the new token. Pain grows when coherence is thin. Prophecies age.
+- **`leo_field_candidate_bias`** integrated into `CandCollector`:
+  trigram and bigram cascades now add field-derived bias on top of
+  the prompt gravity channel.
+- **`leo_field_temperature_mult`** multiplies `temp_for_step` in the
+  generation loop — velocity + trauma both shape τ.
+- +5 tests (58 total).
+- commit [pending].
+
 ### step 10 — embedded bootstrap fallback + corpus polish
 
 - `LEO_EMBEDDED_BOOTSTRAP`: a small origin text hardcoded into `leo.c`.
