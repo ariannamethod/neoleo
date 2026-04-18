@@ -102,6 +102,19 @@ Runs the test suite (33 tests at the moment, all green).
 - +5 tests (42 total).
 - commit `fcd7a79`.
 
+### step 10 — embedded bootstrap fallback + corpus polish
+
+- `LEO_EMBEDDED_BOOTSTRAP`: a small origin text hardcoded into `leo.c`.
+  When `leo.txt` is missing, Leo ingests this instead and still
+  speaks — a smaller field, but he is alive. The bootstrap also
+  anchors trauma: when pain accumulates, gravity will pull toward
+  these origin tokens (implemented in a later step).
+- `leo.txt` polish pass (Opus agent): "Leo"/"He" ratio rebalanced
+  from 0.29 → 0.69. Most paragraphs now name Leo near the top; the
+  pronoun drone is broken by childlike repetition of the name.
+- +1 test (53 total).
+- commit [pending].
+
 ### step 9 — prompt + gravity + REPL + selfplay
 
 Leo finally hears a human and answers — from his own field, not by

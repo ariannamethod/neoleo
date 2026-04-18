@@ -807,6 +807,15 @@ static void test_leo_respond_empty_prompt_falls_back(void) {
     PASS();
 }
 
+static void test_embedded_bootstrap_is_nonempty(void) {
+    TEST("LEO_EMBEDDED_BOOTSTRAP: non-empty fallback origin text");
+    ASSERT(LEO_EMBEDDED_BOOTSTRAP != NULL, "not null");
+    ASSERT(strlen(LEO_EMBEDDED_BOOTSTRAP) > 100, "has meaningful length");
+    ASSERT(strstr(LEO_EMBEDDED_BOOTSTRAP, "Leo") != NULL,
+           "bootstrap names Leo");
+    PASS();
+}
+
 static void test_leo_respond_gravity_restored_after_call(void) {
     TEST("leo_respond: leo->gravity is cleared when the call returns");
     Leo leo;
@@ -899,6 +908,7 @@ int main(void) {
     test_leo_generate_ex_honors_start_hint();
     test_compute_prompt_gravity_nonempty();
     test_leo_respond_empty_prompt_falls_back();
+    test_embedded_bootstrap_is_nonempty();
     test_leo_respond_gravity_restored_after_call();
 
     /* SPA */
