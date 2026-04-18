@@ -414,6 +414,49 @@ static void test_leo_generate_produces_output(void) {
     PASS();
 }
 
+static void test_leo_generate_starts_upper_ends_punct(void) {
+    TEST("leo_generate: output starts uppercase, ends .!?");
+    Leo leo;
+    leo_init(&leo);
+    leo_ingest(&leo,
+        "Leo watches the rain. Leo listens. The light comes in yellow. "
+        "Leo puts his hand in the light. The hand is warm. He waits. "
+        "The room is quiet. The quiet has weight. Leo hears it. "
+        "Leo has a stone. The stone is grey. Leo keeps it.");
+    char buf[512];
+    for (int trial = 0; trial < 10; trial++) {
+        buf[0] = 0;
+        leo_generate(&leo, buf, sizeof(buf));
+        if (!buf[0]) continue;
+        ASSERT(buf[0] >= 'A' && buf[0] <= 'Z', "first char uppercase");
+        int len = (int)strlen(buf);
+        ASSERT(len > 0 && (buf[len - 1] == '.' || buf[len - 1] == '!' ||
+                           buf[len - 1] == '?'),
+               "last char is .!?");
+    }
+    leo_free(&leo);
+    PASS();
+}
+
+static void test_leo_generate_no_leading_whitespace(void) {
+    TEST("leo_generate: no leading whitespace in output");
+    Leo leo;
+    leo_init(&leo);
+    leo_ingest(&leo,
+        "Leo watches the rain. Leo listens. The light comes in yellow. "
+        "Leo puts his hand in the light. The hand is warm. He waits.");
+    char buf[512];
+    for (int trial = 0; trial < 10; trial++) {
+        buf[0] = 0;
+        leo_generate(&leo, buf, sizeof(buf));
+        if (!buf[0]) continue;
+        ASSERT(buf[0] != ' ' && buf[0] != '\n' && buf[0] != '\t',
+               "first char is not whitespace");
+    }
+    leo_free(&leo);
+    PASS();
+}
+
 static void test_leo_generate_safe_on_empty_leo(void) {
     TEST("leo_generate: degrades gracefully on empty Leo (no ingest)");
     Leo leo;
@@ -476,6 +519,8 @@ int main(void) {
     test_leo_choose_start_after_ingest();
     test_leo_step_token_uses_bigram_fallback();
     test_leo_generate_produces_output();
+    test_leo_generate_starts_upper_ends_punct();
+    test_leo_generate_no_leading_whitespace();
     test_leo_generate_safe_on_empty_leo();
 
     printf("\n=== results: %d passed, %d failed ===\n\n",

@@ -687,6 +687,61 @@ int leo_generate(Leo *leo, char *out, int max_len) {
         pos += len;
     }
     out[pos] = 0;
+
+    /* ---- parse/clean sentence shape: capital start, period end ----
+     *
+     * Without this, multi-byte BPE tokens like ". The " leak text past
+     * the boundary, and start tokens that begin with a space or newline
+     * leave a visible leading gap.
+     *
+     * Rules:
+     *   1. Strip leading whitespace / newlines.
+     *   2. Find the last .!? in the emitted text; truncate after it.
+     *      If none, strip trailing whitespace and append a period.
+     *   3. Capitalize the first alphabetic character if lowercase. */
+
+    /* 1. strip leading whitespace */
+    int lead = 0;
+    while (out[lead] && (out[lead] == ' ' || out[lead] == '\n' ||
+                         out[lead] == '\r' || out[lead] == '\t'))
+        lead++;
+    if (lead > 0) {
+        int rem = (int)strlen(out + lead);
+        memmove(out, out + lead, rem + 1);
+        pos = rem;
+    }
+
+    /* 2. truncate at last sentence-end or append period */
+    int last_end = -1;
+    for (int i = pos - 1; i >= 0; i--) {
+        if (out[i] == '.' || out[i] == '!' || out[i] == '?') {
+            last_end = i;
+            break;
+        }
+    }
+    if (last_end >= 0) {
+        out[last_end + 1] = 0;
+        pos = last_end + 1;
+    } else {
+        while (pos > 0 && (out[pos - 1] == ' ' || out[pos - 1] == '\n' ||
+                           out[pos - 1] == '\r' || out[pos - 1] == '\t'))
+            pos--;
+        out[pos] = 0;
+        if (pos > 0 && pos < max_len - 1) {
+            out[pos++] = '.';
+            out[pos] = 0;
+        }
+    }
+
+    /* 3. capitalize first alpha */
+    for (int i = 0; out[i]; i++) {
+        if (out[i] >= 'a' && out[i] <= 'z') {
+            out[i] = out[i] - ('a' - 'A');
+            break;
+        }
+        if ((out[i] >= 'A' && out[i] <= 'Z')) break;
+    }
+
     leo->step += n;
     return n;
 }
