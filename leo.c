@@ -23,10 +23,13 @@
 #define LEO_MAX_TOKEN_LEN 64
 #define LEO_COOC_WINDOW   5
 #define LEO_COOC_MAX      (256 * 1024)
-#define LEO_BIGRAM_MAX    (64 * 1024)
-#define LEO_TRIGRAM_MAX   (64 * 1024)
+#define LEO_BIGRAM_MAX    (128 * 1024)
+#define LEO_TRIGRAM_MAX   (256 * 1024)
 #define LEO_PAIR_HASH     (64 * 1024)
 #define LEO_MERGE_THRESH  4
+#define LEO_TRI_IDX_MAX   (256 * 1024) /* (a,b) → {c,count} reverse index */
+#define LEO_BI_IDX_MAX    (128 * 1024) /* src → {dst,count} reverse index */
+#define LEO_BEST_OF_K     3
 
 #define LEO_GEN_MAX       256
 #define LEO_GEN_TARGET    20
@@ -306,23 +309,33 @@ static float cooc_get(const CoocField *c, int src, int dst) {
 typedef struct {
     int   src, dst;
     float count;
+    int   next_src;     /* reverse index chain: next bigram with same src */
 } BigramEntry;
 
 typedef struct {
     BigramEntry *entries;
     int          n_entries;
     int          capacity;
+    int         *head_src;  /* [LEO_BI_IDX_MAX] bucket heads, -1 = empty */
 } BigramTable;
 
 static void bigram_init(BigramTable *b, int capacity) {
     b->entries = calloc(capacity, sizeof(BigramEntry));
     b->n_entries = 0;
     b->capacity = capacity;
+    b->head_src = malloc(LEO_BI_IDX_MAX * sizeof(int));
+    for (int i = 0; i < LEO_BI_IDX_MAX; i++) b->head_src[i] = -1;
 }
 
 static void bigram_free(BigramTable *b) {
     free(b->entries); b->entries = NULL;
+    free(b->head_src); b->head_src = NULL;
     b->n_entries = b->capacity = 0;
+}
+
+static uint32_t bigram_src_bucket(int src) {
+    uint32_t key = (uint32_t)src;
+    return fnv1a(&key, sizeof(key)) % LEO_BI_IDX_MAX;
 }
 
 static int bigram_find(const BigramTable *b, int src, int dst) {
@@ -346,9 +359,13 @@ static void bigram_update(BigramTable *b, int src, int dst, float delta) {
         int idx = (start + probe) % b->capacity;
         if (b->entries[idx].count == 0.0f && b->entries[idx].src == 0 &&
             b->entries[idx].dst == 0) {
+            /* insert — link into reverse index bucket for src */
             b->entries[idx].src = src;
             b->entries[idx].dst = dst;
             b->entries[idx].count = delta;
+            uint32_t bk = bigram_src_bucket(src);
+            b->entries[idx].next_src = b->head_src[bk];
+            b->head_src[bk] = idx;
             b->n_entries++;
             return;
         }
@@ -364,6 +381,26 @@ static float bigram_get(const BigramTable *b, int src, int dst) {
     return idx < 0 ? 0.0f : b->entries[idx].count;
 }
 
+/* Walk the reverse-index chain for `src`. Callback returns 0 to continue,
+ * non-zero to abort. */
+static int bigram_walk_src(const BigramTable *b, int src,
+                            int (*cb)(int dst, float count, void *ud),
+                            void *ud) {
+    if (b->n_entries == 0) return 0;
+    uint32_t bk = bigram_src_bucket(src);
+    int idx = b->head_src[bk];
+    int visited = 0;
+    while (idx >= 0) {
+        BigramEntry *e = &b->entries[idx];
+        if (e->src == src) {
+            if (cb(e->dst, e->count, ud)) return visited + 1;
+            visited++;
+        }
+        idx = e->next_src;
+    }
+    return visited;
+}
+
 /* ========================================================================
  * TRIGRAM TABLE — (a,b) → c, count
  * ======================================================================== */
@@ -371,28 +408,38 @@ static float bigram_get(const BigramTable *b, int src, int dst) {
 typedef struct {
     int   a, b, c;
     float count;
+    int   next_ab;      /* reverse index chain: next trigram with same (a,b) */
 } TrigramEntry;
 
 typedef struct {
     TrigramEntry *entries;
     int           n_entries;
     int           capacity;
+    int          *head_ab;  /* [LEO_TRI_IDX_MAX] bucket heads, -1 = empty */
 } TrigramTable;
+
+static uint32_t trigram_hash(int a, int b, int c) {
+    uint32_t key[3] = { (uint32_t)a, (uint32_t)b, (uint32_t)c };
+    return fnv1a(key, sizeof(key));
+}
+
+static uint32_t trigram_ab_bucket(int a, int b) {
+    uint32_t key[2] = { (uint32_t)a, (uint32_t)b };
+    return fnv1a(key, sizeof(key)) % LEO_TRI_IDX_MAX;
+}
 
 static void trigram_init(TrigramTable *t, int capacity) {
     t->entries = calloc(capacity, sizeof(TrigramEntry));
     t->n_entries = 0;
     t->capacity = capacity;
+    t->head_ab = malloc(LEO_TRI_IDX_MAX * sizeof(int));
+    for (int i = 0; i < LEO_TRI_IDX_MAX; i++) t->head_ab[i] = -1;
 }
 
 static void trigram_free(TrigramTable *t) {
     free(t->entries); t->entries = NULL;
+    free(t->head_ab); t->head_ab = NULL;
     t->n_entries = t->capacity = 0;
-}
-
-static uint32_t trigram_hash(int a, int b, int c) {
-    uint32_t key[3] = { (uint32_t)a, (uint32_t)b, (uint32_t)c };
-    return fnv1a(key, sizeof(key));
 }
 
 static int trigram_find(const TrigramTable *t, int a, int b, int c) {
@@ -417,10 +464,14 @@ static void trigram_update(TrigramTable *t, int a, int b, int c, float delta) {
         int idx = (start + probe) % t->capacity;
         if (t->entries[idx].count == 0.0f && t->entries[idx].a == 0 &&
             t->entries[idx].b == 0 && t->entries[idx].c == 0) {
+            /* insert + link into (a,b) reverse bucket */
             t->entries[idx].a = a;
             t->entries[idx].b = b;
             t->entries[idx].c = c;
             t->entries[idx].count = delta;
+            uint32_t bk = trigram_ab_bucket(a, b);
+            t->entries[idx].next_ab = t->head_ab[bk];
+            t->head_ab[bk] = idx;
             t->n_entries++;
             return;
         }
@@ -435,6 +486,25 @@ static void trigram_update(TrigramTable *t, int a, int b, int c, float delta) {
 static float trigram_get(const TrigramTable *t, int a, int b, int c) {
     int idx = trigram_find(t, a, b, c);
     return idx < 0 ? 0.0f : t->entries[idx].count;
+}
+
+/* Walk reverse-index for (a,b). Callback returns 0 to continue, non-zero aborts. */
+static int trigram_walk_ab(const TrigramTable *t, int a, int b,
+                            int (*cb)(int c, float count, void *ud),
+                            void *ud) {
+    if (t->n_entries == 0) return 0;
+    uint32_t bk = trigram_ab_bucket(a, b);
+    int idx = t->head_ab[bk];
+    int visited = 0;
+    while (idx >= 0) {
+        TrigramEntry *e = &t->entries[idx];
+        if (e->a == a && e->b == b) {
+            if (cb(e->c, e->count, ud)) return visited + 1;
+            visited++;
+        }
+        idx = e->next_ab;
+    }
+    return visited;
 }
 
 /* ========================================================================
@@ -664,69 +734,81 @@ int leo_choose_start(const Leo *leo) {
     return pick < 0 ? -1 : cand_ids[pick];
 }
 
-/* Sparse next-token sampling.
+/* Sparse next-token sampling — reverse-index lookup edition.
  *
- *   prev2, prev1: last two tokens of the generation context (prev2 may be -1)
- *   temp:         sampling temperature (>0). Lower = sharper, higher = softer.
+ *   prev2, prev1: last two tokens (prev2 may be -1)
+ *   temp:         sampling temperature (>0)
  *
  * Strategy:
- *   1. if (prev2, prev1) has trigram successors → candidates from those,
- *      blended 0.7·trigram_count + 0.3·cooc(prev1, c)
- *   2. else if prev1 has bigram successors → candidates from those
- *   3. else fall back to a fresh start token
+ *   1. reverse-index walk of (prev2, prev1) trigrams →
+ *      candidates blended 0.7·tri + 0.3·cooc(prev1, c)
+ *   2. reverse-index walk of prev1 bigrams as fallback
+ *   3. fresh start if both empty
  *
- * Temperature is applied in count-space via pow(c, 1/T) before the
- * weighted draw. This is the Q / Python posture: never compute logits
- * over the full vocabulary.
- */
+ * Reverse indexes turn the former 65K entries scan per step into an
+ * O(bucket) lookup, so step_token is now O(1) amortized instead of
+ * O(N_trigram_entries). */
+#define LEO_MAX_CANDS 256
+
+typedef struct {
+    int   *id;
+    float *sc;
+    int    n;
+    int    max;
+    int    prev1;
+    const CoocField *cooc;
+} CandCollector;
+
+static int cand_collect_tri(int c, float count, void *ud) {
+    CandCollector *cc = (CandCollector *)ud;
+    if (cc->n >= cc->max) return 1;
+    float s = cooc_get(cc->cooc, cc->prev1, c);
+    cc->id[cc->n] = c;
+    cc->sc[cc->n] = 0.7f * count + 0.3f * s;
+    cc->n++;
+    return 0;
+}
+
+static int cand_collect_bi(int dst, float count, void *ud) {
+    CandCollector *cc = (CandCollector *)ud;
+    if (cc->n >= cc->max) return 1;
+    cc->id[cc->n] = dst;
+    cc->sc[cc->n] = count;
+    cc->n++;
+    return 0;
+}
+
 int leo_step_token(const Leo *leo, int prev2, int prev1, float temp) {
     if (prev1 < 0) return leo_choose_start(leo);
     temp = clampf(temp, 0.05f, 10.0f);
     float inv_temp = 1.0f / temp;
 
-    /* reusable candidate buffer */
-    #define MAX_CANDS 128
-    int   cand_id[MAX_CANDS];
-    float cand_sc[MAX_CANDS];
-    int   nc = 0;
+    int   cand_id[LEO_MAX_CANDS];
+    float cand_sc[LEO_MAX_CANDS];
+    CandCollector cc = { cand_id, cand_sc, 0, LEO_MAX_CANDS,
+                         prev1, &leo->cooc };
 
-    /* 1. trigram successors */
-    if (prev2 >= 0) {
-        for (int i = 0; i < leo->trigrams.capacity && nc < MAX_CANDS; i++) {
-            TrigramEntry *e = &leo->trigrams.entries[i];
-            if (e->count <= 0) continue;
-            if (e->a != prev2 || e->b != prev1) continue;
-            float g = e->count;
-            float s = cooc_get(&leo->cooc, prev1, e->c);
-            float blended = 0.7f * g + 0.3f * s;
-            cand_id[nc] = e->c;
-            cand_sc[nc] = blended;
-            nc++;
-        }
-    }
+    if (prev2 >= 0)
+        trigram_walk_ab(&leo->trigrams, prev2, prev1, cand_collect_tri, &cc);
+    if (cc.n == 0)
+        bigram_walk_src(&leo->bigrams, prev1, cand_collect_bi, &cc);
+    if (cc.n == 0) return leo_choose_start(leo);
 
-    /* 2. bigram successors as fallback */
-    if (nc == 0) {
-        for (int i = 0; i < leo->bigrams.capacity && nc < MAX_CANDS; i++) {
-            BigramEntry *e = &leo->bigrams.entries[i];
-            if (e->count <= 0) continue;
-            if (e->src != prev1) continue;
-            cand_id[nc] = e->dst;
-            cand_sc[nc] = e->count;
-            nc++;
-        }
-    }
-
-    /* 3. nothing — start fresh */
-    if (nc == 0) return leo_choose_start(leo);
-
-    /* temperature in count-space */
-    for (int i = 0; i < nc; i++)
+    for (int i = 0; i < cc.n; i++)
         cand_sc[i] = powf(cand_sc[i], inv_temp);
 
-    int pick = weighted_sample(cand_sc, nc);
+    int pick = weighted_sample(cand_sc, cc.n);
     return pick < 0 ? -1 : cand_id[pick];
-    #undef MAX_CANDS
+}
+
+/* Temperature schedule: start sharp, relax into the middle.
+ *    step 0..1   → 0.40 (clean seed / early grammar lock)
+ *    step 2..5   → 0.55 (middle early — careful)
+ *    step 6+     → 0.75 (spontaneity, child play) */
+static float temp_for_step(int step) {
+    if (step < 2) return 0.40f;
+    if (step < 6) return 0.55f;
+    return 0.75f;
 }
 
 /* Core sentence generator with full knobs.
@@ -770,7 +852,8 @@ int leo_generate_ex(Leo *leo, char *out, int max_len,
     for (int t = 1; t < LEO_GEN_MAX; t++) {
         int prev1 = ctx[n - 1];
         int prev2 = n >= 2 ? ctx[n - 2] : -1;
-        int nxt = leo_step_token(leo, prev2, prev1, 0.7f);
+        float tau = temp_for_step(t);
+        int nxt = leo_step_token(leo, prev2, prev1, tau);
         if (nxt < 0) break;
 
         /* light repetition guard: kill immediate and back-to-back repeats */
@@ -861,6 +944,76 @@ int leo_generate_ex(Leo *leo, char *out, int max_len,
 
     leo->step += n;
     return n;
+}
+
+/* coherence_score — how "together" a sentence sits in the field:
+ * average bigram density + 0.8·trigram density + 0.5·hebbian density,
+ * plus a length bonus that rewards real sentences over fragments. */
+float leo_coherence_score(const Leo *leo, const int *ids, int n) {
+    if (n < 2) return 0.0f;
+    float bi = 0, tri = 0, hb = 0;
+    for (int i = 0; i < n - 1; i++)
+        bi += bigram_get(&leo->bigrams, ids[i], ids[i + 1]);
+    for (int i = 0; i < n - 2; i++)
+        tri += trigram_get(&leo->trigrams, ids[i], ids[i + 1], ids[i + 2]);
+    int cap_h = n - 1 < 20 ? n - 1 : 20;
+    for (int i = 0; i < cap_h; i++)
+        hb += cooc_get(&leo->cooc, ids[i], ids[i + 1]);
+    float len_bonus = n > 15 ? 1.5f : (n > 10 ? 0.8f : (n > 6 ? 0.2f : -0.5f));
+    return bi / (float)(n - 1)
+         + 0.8f * (n > 2 ? tri / (float)(n - 2) : 0.0f)
+         + 0.5f * hb / (float)(n - 1)
+         + len_bonus;
+}
+
+/* Generate K candidate sentences and return the one with the highest
+ * coherence_score. An early-exit if a candidate is already strong. */
+int leo_generate_best(Leo *leo, int k,
+                      char *out, int max_len,
+                      int start_hint,
+                      const int *tail, int n_tail,
+                      int *emitted_tail, int *n_emit) {
+    if (k < 1) k = 1;
+    if (k > LEO_BEST_OF_K) k = LEO_BEST_OF_K;
+
+    char  best_text[1024]; best_text[0] = 0;
+    int   best_ids[LEO_GEN_MAX];
+    int   best_n = 0;
+    float best_score = -1e30f;
+    int   best_tokens = 0;
+
+    for (int trial = 0; trial < k; trial++) {
+        char  buf[1024];
+        int   ids[LEO_GEN_MAX];
+        int   cap = LEO_GEN_MAX;
+        int   produced = leo_generate_ex(leo, buf, sizeof(buf),
+                                         start_hint, tail, n_tail,
+                                         ids, &cap);
+        float sc = leo_coherence_score(leo, ids, cap);
+        if (sc > best_score) {
+            best_score = sc;
+            strncpy(best_text, buf, sizeof(best_text) - 1);
+            best_text[sizeof(best_text) - 1] = 0;
+            memcpy(best_ids, ids, cap * sizeof(int));
+            best_n = cap;
+            best_tokens = produced;
+        }
+        /* early exit on a strong first try */
+        if (sc > 1.0f && cap > 12) break;
+    }
+
+    /* copy best into caller buffers */
+    int blen = (int)strlen(best_text);
+    if (blen >= max_len) blen = max_len - 1;
+    memcpy(out, best_text, blen);
+    out[blen] = 0;
+    if (emitted_tail && n_emit) {
+        int want = *n_emit;
+        if (want > best_n) want = best_n;
+        memcpy(emitted_tail, best_ids + (best_n - want), want * sizeof(int));
+        *n_emit = want;
+    }
+    return best_tokens;
 }
 
 /* Public one-liner: no seed hint, no tail bias. */
@@ -955,20 +1108,11 @@ int leo_chain(Leo *leo, int n_sentences, char *out, int max_len) {
     int tail_len = 0;
 
     for (int s = 0; s < n_sentences; s++) {
-        int cap = LEO_TAIL_WIN;
-        /* reuse emitted_tail as the sentence token record too — but we
-         * need *all* tokens of the sentence for SPA embedding, not just
-         * the tail. We do a helper generation that records everything. */
-        int  produced = 0;
         int  tok_cap = LEO_GEN_MAX;
         int *tok_buf = sent_ids[s];
-        /* temporarily set cap to full LEO_GEN_MAX so emitted_tail receives
-         * the full token list (truncated at tail window inside _ex is just
-         * a copy — we want more). We extend leo_generate_ex to cope with
-         * larger emitted buffers: it copies min(n, cap) trailing tokens.
-         * By setting cap = LEO_GEN_MAX we effectively get the full context. */
-        produced = leo_generate_ex(
-            leo, sent_text[s], sizeof(sent_text[s]),
+        int  produced = leo_generate_best(
+            leo, LEO_BEST_OF_K,
+            sent_text[s], sizeof(sent_text[s]),
             /*start_hint*/ -1,
             /*tail*/ s == 0 ? NULL : tail,
             /*n_tail*/ s == 0 ? 0 : tail_len,

@@ -543,6 +543,97 @@ static void test_leo_chain_produces_multiple_sentences(void) {
     PASS();
 }
 
+/* ================================================================
+ * REVERSE INDEXES + SCHEDULE + BEST-OF-K
+ * ================================================================ */
+
+static int walk_count_cb(int v, float count, void *ud) {
+    (void)v; (void)count;
+    int *n = (int *)ud;
+    (*n)++;
+    return 0;
+}
+
+static void test_bigram_walk_src_visits_all(void) {
+    TEST("bigram_walk_src: visits every destination for a src");
+    BigramTable b;
+    bigram_init(&b, 1024);
+    bigram_update(&b, 7, 10, 1.0f);
+    bigram_update(&b, 7, 20, 2.0f);
+    bigram_update(&b, 7, 30, 3.0f);
+    bigram_update(&b, 99, 40, 1.0f);
+    int seen = 0;
+    bigram_walk_src(&b, 7, walk_count_cb, &seen);
+    ASSERT(seen == 3, "three successors for src=7");
+    int other = 0;
+    bigram_walk_src(&b, 99, walk_count_cb, &other);
+    ASSERT(other == 1, "one successor for src=99");
+    bigram_free(&b);
+    PASS();
+}
+
+static void test_trigram_walk_ab_visits_all(void) {
+    TEST("trigram_walk_ab: visits every c for an (a,b) pair");
+    TrigramTable t;
+    trigram_init(&t, 2048);
+    trigram_update(&t, 1, 2, 10, 1.0f);
+    trigram_update(&t, 1, 2, 20, 1.0f);
+    trigram_update(&t, 1, 2, 30, 1.0f);
+    trigram_update(&t, 5, 6, 99, 1.0f);
+    int seen = 0;
+    trigram_walk_ab(&t, 1, 2, walk_count_cb, &seen);
+    ASSERT(seen == 3, "three c-values for (1,2)");
+    int other = 0;
+    trigram_walk_ab(&t, 5, 6, walk_count_cb, &other);
+    ASSERT(other == 1, "one c-value for (5,6)");
+    trigram_free(&t);
+    PASS();
+}
+
+static void test_temp_schedule_ranges(void) {
+    TEST("temp_for_step: monotone-ish schedule from sharp to soft");
+    float t0 = temp_for_step(0);
+    float t3 = temp_for_step(3);
+    float t8 = temp_for_step(8);
+    ASSERT(t0 < t3, "start sharper than middle");
+    ASSERT(t3 < t8, "middle sharper than late");
+    ASSERT(t0 >= 0.3f && t0 <= 0.5f, "t0 in expected range");
+    ASSERT(t8 >= 0.6f && t8 <= 0.9f, "late in expected range");
+    PASS();
+}
+
+static void test_coherence_score_positive_on_seen_phrase(void) {
+    TEST("leo_coherence_score: positive on phrase present in ingested corpus");
+    Leo leo;
+    leo_init(&leo);
+    leo_ingest(&leo,
+        "Leo watches the rain. Leo watches the rain. Leo watches the rain. "
+        "Leo watches the rain. Leo watches the rain.");
+    int ids[32];
+    int n = bpe_encode(&leo.bpe, (const uint8_t *)"Leo watches the rain", 20,
+                        ids, 32);
+    float sc = leo_coherence_score(&leo, ids, n);
+    ASSERT(sc > 0.0f, "seen phrase scores positive");
+    leo_free(&leo);
+    PASS();
+}
+
+static void test_leo_generate_best_picks_coherent(void) {
+    TEST("leo_generate_best: returns non-empty output from K trials");
+    Leo leo;
+    leo_init(&leo);
+    leo_ingest(&leo,
+        "Leo watches the rain. Leo listens. The light comes in yellow. "
+        "He waits. The quiet has weight. Leo has a stone.");
+    char buf[256];
+    int produced = leo_generate_best(&leo, 3, buf, sizeof(buf), -1, NULL, 0,
+                                     NULL, NULL);
+    ASSERT(produced > 0, "at least one token produced");
+    ASSERT(strlen(buf) > 0, "non-empty");
+    leo_free(&leo);
+    PASS();
+}
+
 static void test_leo_generate_ex_honors_start_hint(void) {
     TEST("leo_generate_ex: start_hint is used as first token");
     Leo leo;
@@ -712,6 +803,11 @@ int main(void) {
     test_leo_choose_continuation_matches_start_without_tail();
     test_leo_choose_continuation_shifts_with_tail();
     test_leo_chain_produces_multiple_sentences();
+    test_bigram_walk_src_visits_all();
+    test_trigram_walk_ab_visits_all();
+    test_temp_schedule_ranges();
+    test_coherence_score_positive_on_seen_phrase();
+    test_leo_generate_best_picks_coherent();
     test_leo_generate_ex_honors_start_hint();
 
     /* SPA */

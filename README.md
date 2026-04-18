@@ -100,6 +100,31 @@ Runs the test suite (33 tests at the moment, all green).
 - `leo_chain` now does two SPA passes: find the sentence whose score
   falls below `avg × 0.52`, reseed it from a neighbour's tail.
 - +5 tests (42 total).
+- commit `fcd7a79`.
+
+### step 7 — reverse indexes + temperature schedule + best-of-K
+
+Four knobs against sampling artifacts ("thout", "jus kin", "One dow").
+
+- **Reverse indexes.** `BigramTable` gains `head_src[]` bucket heads and
+  per-entry `next_src`. `TrigramTable` gains `head_ab[]` and `next_ab`.
+  `bigram_walk_src` and `trigram_walk_ab` iterate candidates via the
+  chain instead of scanning the full hash table. `leo_step_token` is
+  now O(bucket) per step instead of O(N_entries) — 50–100× faster and
+  no more missed candidates on large tables.
+- **Capacity up.** `TRIGRAM_MAX` 64K → 256K, `BIGRAM_MAX` 64K → 128K.
+  Trigram table was saturating on the 298KB corpus and losing 3-gram
+  contexts that would have fixed "some thought" over "some thout".
+- **Temperature schedule.** `temp_for_step`: 0.40 at steps 0–1 (sharp
+  seed), 0.55 at 2–5 (early grammar), 0.75 at 6+ (middle, play). Not
+  a monotonic cool-down — the sharpness lives where it helps, the
+  softness where child voice breathes.
+- **Best-of-3 with coherence_score.** `leo_coherence_score` = average
+  bigram + 0.8·trigram + 0.5·hebbian + length bonus. `leo_generate_best`
+  draws K candidates per sentence, returns the one with the highest
+  score, early-exits on a strong first try. `leo_chain` uses it per
+  sentence.
+- +5 tests (47 total).
 - commit [pending].
 
 ---
