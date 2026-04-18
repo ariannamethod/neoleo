@@ -102,6 +102,24 @@ Runs the test suite (33 tests at the moment, all green).
 - +5 tests (42 total).
 - commit `fcd7a79`.
 
+### step 8 — BPE word-boundary constraint
+
+- `pair_creates_word_gap`: refuse merges where the concatenation would
+  contain whitespace *between* non-whitespace bytes — alpha–ws–alpha.
+  Leading space (`" the"`) and trailing space (`"the "`) remain valid
+  word tokens; the cross-word fusion `"he has"` is blocked.
+- After constraint: merges drop 4117 → 2470 (the blocked pairs were
+  mostly cross-word glue). Top merges are now clean word fragments:
+  `"chi"+"ld"`, `"E"+"ven"`, `"be"+"gin"`.
+- Child voice tightens noticeably:
+  > *Leo heard. He respects. He knows you can use on strange. He
+  > apologize a word.*
+  > *That he is the brown of the speaking when he is sure it is a
+  > ceremony.*
+  > *He had had a small child hiding is love. Is a small magic.*
+- +2 tests (49 total).
+- commit [pending].
+
 ### step 7 — reverse indexes + temperature schedule + best-of-K
 
 Four knobs against sampling artifacts ("thout", "jus kin", "One dow").

@@ -146,6 +146,35 @@ static int contains_boundary_not_at_end(const BPE *bpe, int id) {
     return 0;
 }
 
+/* true iff merging `left` with `right` would create a token whose bytes
+ * have whitespace (space / tab / newline / cr) *between* non-whitespace
+ * content — i.e. a single token spanning a word gap. " the" (leading
+ * space) and "the " (trailing space) are fine; "he has" (alpha-ws-alpha)
+ * is not. Refusing these keeps Leo's tokens at the word level. */
+static int pair_creates_word_gap(const BPE *bpe, int left, int right) {
+    if (left < 0 || right < 0 || left >= bpe->vocab_size ||
+        right >= bpe->vocab_size) return 0;
+    int la = bpe->vocab_len[left];
+    int lb = bpe->vocab_len[right];
+    int total = la + lb;
+    int first = -1, last = -1;
+    for (int i = 0; i < total; i++) {
+        uint8_t c = i < la ? bpe->vocab_bytes[left][i]
+                           : bpe->vocab_bytes[right][i - la];
+        if (c != ' ' && c != '\n' && c != '\r' && c != '\t') {
+            if (first < 0) first = i;
+            last = i;
+        }
+    }
+    if (first < 0) return 0; /* all whitespace — degenerate but allowed */
+    for (int i = first; i <= last; i++) {
+        uint8_t c = i < la ? bpe->vocab_bytes[left][i]
+                           : bpe->vocab_bytes[right][i - la];
+        if (c == ' ' || c == '\n' || c == '\r' || c == '\t') return 1;
+    }
+    return 0;
+}
+
 /* Promote the most frequent pair whose count exceeds LEO_MERGE_THRESH,
  * subject to the sentence-boundary constraint described above.
  * Returns 1 if a merge was learned, 0 otherwise. */
@@ -157,6 +186,9 @@ static int bpe_learn_merge(BPE *bpe) {
         /* refuse merges that would cross a sentence boundary */
         if (contains_boundary_not_at_end(bpe, bpe->pair_left[i])) continue;
         if (contains_boundary_not_at_end(bpe, bpe->pair_right[i])) continue;
+        /* refuse merges that would span a word gap */
+        if (pair_creates_word_gap(bpe, bpe->pair_left[i],
+                                  bpe->pair_right[i])) continue;
         if (bpe->pair_count[i] > best_count) {
             best_count = bpe->pair_count[i];
             best = i;

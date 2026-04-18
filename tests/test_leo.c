@@ -118,6 +118,42 @@ static void test_bpe_learn_merge_ignores_weak_pair(void) {
     PASS();
 }
 
+static void test_pair_creates_word_gap_detector(void) {
+    TEST("pair_creates_word_gap: detects alpha-ws-alpha concat");
+    BPE bpe;
+    bpe_init(&bpe);
+    /* ' ' + 'a' — concat " a", no internal gap (ws leads content) */
+    ASSERT(pair_creates_word_gap(&bpe, ' ', 'a') == 0, "leading ws is ok");
+    /* 'a' + ' ' — concat "a ", no internal gap (ws trails) */
+    ASSERT(pair_creates_word_gap(&bpe, 'a', ' ') == 0, "trailing ws is ok");
+    /* 'a' + ' a' would need a merged token; simulate via preparing " a" first */
+    /* but simpler: 'e' + ' ' + 'a' cannot happen via pair api — test
+     * the detector on direct bytes using two-byte tokens. We approximate
+     * by pre-merging " a" via bpe_count + bpe_learn. */
+    for (int i = 0; i < LEO_MERGE_THRESH + 1; i++) bpe_count_pair(&bpe, ' ', 'a');
+    bpe_learn_merge(&bpe);
+    int sp_a = 256; /* " a" */
+    /* now 'e' + " a" would produce "e a" with internal gap */
+    ASSERT(pair_creates_word_gap(&bpe, 'e', sp_a) == 1, "alpha + ws+alpha is a gap");
+    PASS();
+}
+
+static void test_bpe_refuses_cross_word_merge(void) {
+    TEST("bpe_learn_merge: refuses merges that would cross a word gap");
+    BPE bpe;
+    bpe_init(&bpe);
+    /* build " h" first */
+    for (int i = 0; i < LEO_MERGE_THRESH + 1; i++) bpe_count_pair(&bpe, ' ', 'h');
+    bpe_learn_merge(&bpe);
+    int sp_h = 256;
+    /* try 'e' + " h" — this would make "e h", a cross-word fusion */
+    for (int i = 0; i < LEO_MERGE_THRESH + 10; i++) bpe_count_pair(&bpe, 'e', sp_h);
+    int before = bpe.vocab_size;
+    bpe_learn_merge(&bpe);
+    ASSERT(bpe.vocab_size == before, "cross-word merge was refused");
+    PASS();
+}
+
 static void test_bpe_refuses_cross_boundary_merge(void) {
     TEST("bpe_learn_merge: refuses to merge across .!? boundary");
     BPE bpe;
@@ -767,6 +803,8 @@ int main(void) {
     test_bpe_learn_merge_promotes_frequent_pair();
     test_bpe_learn_merge_ignores_weak_pair();
     test_bpe_refuses_cross_boundary_merge();
+    test_pair_creates_word_gap_detector();
+    test_bpe_refuses_cross_word_merge();
     test_bpe_encode_applies_learned_merge();
 
     /* cooc */
