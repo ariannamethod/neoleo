@@ -32,6 +32,9 @@
 #define LEO_GEN_TARGET    20
 #define LEO_GEN_MIN       6
 #define LEO_SEED_CANDS    64
+#define LEO_CHAIN_MIN     5
+#define LEO_CHAIN_MAX     12
+#define LEO_TAIL_WIN      8    /* how many final tokens of a sentence flow into next */
 
 /* ========================================================================
  * MATH UTILITIES
@@ -563,6 +566,60 @@ static int weighted_sample(const float *scores, int n) {
     return n - 1;
 }
 
+/* pick a start token biased by resonance with a set of "tail" tokens
+ * from the end of the previous sentence. This is how chains stay on
+ * one theme: each new sentence starts closer to the field that the
+ * previous sentence sat inside. If tail is NULL/empty, the result
+ * matches leo_choose_start. */
+int leo_choose_continuation(const Leo *leo, const int *tail, int n_tail) {
+    int   cand_ids[LEO_SEED_CANDS];
+    float cand_freq[LEO_SEED_CANDS];
+    int   n = 0;
+    float min_kept = 0;
+
+    /* same top-LEO_SEED_CANDS clean-seed collection as choose_start */
+    for (int i = 0; i < leo->cooc.freq_size; i++) {
+        float f = leo->cooc.freq[i];
+        if (f <= 0) continue;
+        if (!is_clean_seed_token(&leo->bpe, i)) continue;
+        if (n < LEO_SEED_CANDS) {
+            cand_ids[n] = i;
+            cand_freq[n] = f;
+            if (n == 0 || f < min_kept) min_kept = f;
+            n++;
+        } else if (f > min_kept) {
+            int min_idx = 0;
+            for (int k = 1; k < LEO_SEED_CANDS; k++)
+                if (cand_freq[k] < cand_freq[min_idx]) min_idx = k;
+            cand_ids[min_idx] = i;
+            cand_freq[min_idx] = f;
+            min_kept = cand_freq[0];
+            for (int k = 1; k < LEO_SEED_CANDS; k++)
+                if (cand_freq[k] < min_kept) min_kept = cand_freq[k];
+        }
+    }
+    if (n == 0) return -1;
+
+    /* resonance boost: sum cooc(tail_token, candidate) across tail */
+    if (tail && n_tail > 0) {
+        for (int i = 0; i < n; i++) {
+            float res = 0;
+            for (int t = 0; t < n_tail; t++) {
+                if (tail[t] < 0) continue;
+                res += cooc_get(&leo->cooc, tail[t], cand_ids[i]);
+                res += cooc_get(&leo->cooc, cand_ids[i], tail[t]);
+            }
+            /* multiplicative boost, bounded so a single resonant pair does
+             * not completely dominate — the field still gets a vote */
+            float mult = 1.0f + clampf(res / (float)(n_tail * 4), 0.0f, 3.0f);
+            cand_freq[i] *= mult;
+        }
+    }
+
+    int pick = weighted_sample(cand_freq, n);
+    return pick < 0 ? -1 : cand_ids[pick];
+}
+
 /* pick a start token: weighted by cooc.freq, restricted to clean-seed
  * tokens, drawn from the top LEO_SEED_CANDS frequencies. This is the
  * "Leo speaks from his field, not from the prompt" invariant. */
@@ -663,17 +720,39 @@ int leo_step_token(const Leo *leo, int prev2, int prev1, float temp) {
     #undef MAX_CANDS
 }
 
-/* Generate a sentence. Emits decoded bytes into `out` (null-terminated,
- * truncated to max_len-1 bytes). Returns the number of tokens produced. */
-int leo_generate(Leo *leo, char *out, int max_len) {
-    if (!out || max_len < 2) return 0;
+/* Core sentence generator with full knobs.
+ *
+ *   start_hint       if >= 0, use as start token instead of choose_start
+ *   tail, n_tail     bias choose_continuation by these recent tokens
+ *                    (ignored if start_hint is set)
+ *   emitted_tail     optional output buffer receiving the last tokens
+ *                    of the generation (caller sets capacity via *n_emit)
+ *
+ * The public leo_generate is a thin wrapper over this with no hints.
+ */
+int leo_generate_ex(Leo *leo, char *out, int max_len,
+                    int start_hint,
+                    const int *tail, int n_tail,
+                    int *emitted_tail, int *n_emit) {
+    if (!out || max_len < 2) {
+        if (emitted_tail && n_emit) *n_emit = 0;
+        return 0;
+    }
     out[0] = 0;
 
     int ctx[LEO_GEN_MAX];
     int n = 0;
 
-    int start = leo_choose_start(leo);
-    if (start < 0) { snprintf(out, max_len, "..."); return 0; }
+    int start;
+    if (start_hint >= 0) start = start_hint;
+    else if (tail && n_tail > 0) start = leo_choose_continuation(leo, tail, n_tail);
+    else start = leo_choose_start(leo);
+
+    if (start < 0) {
+        snprintf(out, max_len, "...");
+        if (emitted_tail && n_emit) *n_emit = 0;
+        return 0;
+    }
     ctx[n++] = start;
 
     int target = LEO_GEN_TARGET + (rand() % 10) - 5;
@@ -760,8 +839,65 @@ int leo_generate(Leo *leo, char *out, int max_len) {
         if ((out[i] >= 'A' && out[i] <= 'Z')) break;
     }
 
+    /* copy the tail tokens for the caller (chain continuity) */
+    if (emitted_tail && n_emit && *n_emit > 0) {
+        int want = *n_emit;
+        int src_start = n - want; if (src_start < 0) src_start = 0;
+        int take = n - src_start;
+        for (int i = 0; i < take; i++) emitted_tail[i] = ctx[src_start + i];
+        *n_emit = take;
+    } else if (n_emit) {
+        *n_emit = 0;
+    }
+
     leo->step += n;
     return n;
+}
+
+/* Public one-liner: no seed hint, no tail bias. */
+int leo_generate(Leo *leo, char *out, int max_len) {
+    return leo_generate_ex(leo, out, max_len, -1, NULL, 0, NULL, NULL);
+}
+
+/* Chain generation: emit `n_sentences` sentences with cooc-driven
+ * semantic continuity. Each next sentence's start is biased by the
+ * tail of the previous one.  Writes a single blob of text separated
+ * by spaces into `out`. Returns total tokens emitted across all
+ * sentences. */
+int leo_chain(Leo *leo, int n_sentences, char *out, int max_len) {
+    if (!out || max_len < 2) return 0;
+    if (n_sentences < 1) n_sentences = 1;
+    if (n_sentences > LEO_CHAIN_MAX) n_sentences = LEO_CHAIN_MAX;
+
+    int total = 0;
+    int pos = 0;
+    out[0] = 0;
+
+    int tail[LEO_TAIL_WIN];
+    int tail_len = 0;
+
+    for (int s = 0; s < n_sentences; s++) {
+        char sent[1024];
+        int  cap = LEO_TAIL_WIN;
+        int  produced = leo_generate_ex(
+            leo, sent, sizeof(sent),
+            /*start_hint*/ -1,
+            /*tail*/ s == 0 ? NULL : tail,
+            /*n_tail*/ s == 0 ? 0 : tail_len,
+            /*emitted_tail*/ tail,
+            /*n_emit*/ &cap);
+        tail_len = cap;
+        total += produced;
+
+        int slen = (int)strlen(sent);
+        if (slen == 0) continue;
+        if (pos > 0 && pos + 1 < max_len) out[pos++] = ' ';
+        if (pos + slen >= max_len - 1) { out[pos] = 0; break; }
+        memcpy(out + pos, sent, slen);
+        pos += slen;
+        out[pos] = 0;
+    }
+    return total;
 }
 
 void leo_stats(const Leo *leo) {
@@ -816,12 +952,18 @@ int main(int argc, char **argv) {
     leo_stats(&leo);
 
     /* speak a few sentences from the field — no prompt */
-    printf("\n[speak] five sentences from the field:\n");
+    printf("\n[speak] five sentences from the field (isolated):\n");
     for (int i = 0; i < 5; i++) {
         char reply[1024];
         leo_generate(&leo, reply, sizeof(reply));
-        printf("  %d)%s\n", i + 1, reply);
+        printf("  %d) %s\n", i + 1, reply);
     }
+
+    /* speak a chain — sentences carry a thread through cooc resonance */
+    printf("\n[chain] eight sentences as one flow:\n");
+    char chain[4096];
+    leo_chain(&leo, 8, chain, sizeof(chain));
+    printf("  %s\n", chain);
 
     leo_free(&leo);
     return 0;

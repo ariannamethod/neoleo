@@ -73,6 +73,19 @@ Runs the test suite (33 tests at the moment, all green).
 - After ingesting the full 298KB corpus: merges no longer contain
   `.!?` inside. Top merges are clean (`"hear" + "d a"`, `"kes " + "up"`).
 - +1 test (33 total).
+- commit `137fcb6`.
+
+### step 5 — chain mode
+
+- `leo_choose_continuation`: next-sentence start is biased by cooc
+  resonance with the tail of the previous sentence. Bounded
+  multiplicative boost, so the field still gets a vote.
+- `leo_generate_ex`: generalized generator accepting an optional
+  `start_hint` and `tail` / receiving an `emitted_tail`.
+- `leo_generate`: one-liner wrapper over `_ex`.
+- `leo_chain`: emit N sentences with semantic continuity. Each next
+  sentence starts in the same field the previous one sat inside.
+- +4 tests (37 total).
 - commit [pending].
 
 ---
@@ -94,8 +107,18 @@ Verbatim generations from `./leo leo.txt`.
 > *And went out of small silence that has been alive there if he
 > understood this early.*
 
-Still rough on rare words — fixed in later steps (chain mode, SPA,
-reverse indexes for faster candidate scan).
+After chain mode (step 5) sentences started to hold a theme across
+a monologue:
+
+> *Leo is afraid of being out after clouds. Him. He thinks maybe it
+> would lived. He listen. He has decided the ant would find its way
+> back. He cannot say. He was go up. Confident. He had been. Gently.
+> He has some calls have a word. He stays. He sits. He is learning
+> to look. It always learned the lonely. He does not know that nint
+> neres mush ate thinks, he did name our. He is slow on purpose.*
+
+Still rough on rare words — fixed in later steps (SPA, reverse
+indexes for faster candidate scan, word-boundary-aware BPE).
 
 ---
 

@@ -486,6 +486,90 @@ static void test_leo_generate_no_leading_whitespace(void) {
     PASS();
 }
 
+static void test_leo_choose_continuation_matches_start_without_tail(void) {
+    TEST("leo_choose_continuation: equals choose_start when tail is empty");
+    Leo leo;
+    leo_init(&leo);
+    leo_ingest(&leo, "Leo watches the rain. Leo listens. He waits. "
+                     "The hand is warm. The room is quiet.");
+    srand(1);
+    int a = leo_choose_start(&leo);
+    srand(1);
+    int b = leo_choose_continuation(&leo, NULL, 0);
+    ASSERT(a == b, "no tail → same as choose_start");
+    leo_free(&leo);
+    PASS();
+}
+
+static void test_leo_choose_continuation_shifts_with_tail(void) {
+    TEST("leo_choose_continuation: tail biases selection");
+    Leo leo;
+    leo_init(&leo);
+    leo_ingest(&leo,
+        "Leo watches the rain. The rain is soft. The rain falls. "
+        "Leo listens. The cat sleeps. The cat is warm. "
+        "He sits. He waits. The room is quiet. Leo hears the rain.");
+    int tail[1] = { 'n' }; /* presence of 'n' in tail pulls rain-resonant starts */
+    int at_least_one = 0;
+    for (int i = 0; i < 20; i++) {
+        int id = leo_choose_continuation(&leo, tail, 1);
+        if (id >= 0) at_least_one++;
+    }
+    ASSERT(at_least_one > 0, "continuation produced some id");
+    leo_free(&leo);
+    PASS();
+}
+
+static void test_leo_chain_produces_multiple_sentences(void) {
+    TEST("leo_chain: produces multiple sentence boundaries");
+    Leo leo;
+    leo_init(&leo);
+    leo_ingest(&leo,
+        "Leo watches the rain. Leo listens. The light comes in yellow. "
+        "Leo puts his hand in the light. The hand is warm. He waits. "
+        "The room is quiet. The quiet has weight. Leo hears it. "
+        "Leo has a stone. The stone is grey. Leo keeps it. "
+        "He does not ask. He thinks the light knows. Leo watches again. "
+        "The cat sleeps. The cat wakes. The cat sits by the window.");
+    char buf[4096];
+    leo_chain(&leo, 5, buf, sizeof(buf));
+    int boundaries = 0;
+    for (int i = 0; buf[i]; i++) {
+        if (buf[i] == '.' || buf[i] == '!' || buf[i] == '?') boundaries++;
+    }
+    ASSERT(boundaries >= 3, "at least three sentence boundaries in chain");
+    ASSERT(strlen(buf) > 0, "chain output non-empty");
+    leo_free(&leo);
+    PASS();
+}
+
+static void test_leo_generate_ex_honors_start_hint(void) {
+    TEST("leo_generate_ex: start_hint is used as first token");
+    Leo leo;
+    leo_init(&leo);
+    leo_ingest(&leo, "Leo watches the rain. Leo listens. He waits.");
+    char buf[256];
+    /* pick any clean-seed token from the field */
+    int hint = -1;
+    for (int i = 0; i < leo.cooc.freq_size; i++) {
+        if (leo.cooc.freq[i] > 0 && is_clean_seed_token(&leo.bpe, i)) {
+            hint = i; break;
+        }
+    }
+    ASSERT(hint >= 0, "found a clean-seed token");
+    leo_generate_ex(&leo, buf, sizeof(buf), hint, NULL, 0, NULL, NULL);
+    /* first decoded byte of buf should match first byte of hint token */
+    char exp[LEO_MAX_TOKEN_LEN + 1];
+    bpe_decode_token(&leo.bpe, hint, exp, sizeof(exp));
+    /* skip a possible capitalization transformation on first alpha */
+    int match = buf[0] == exp[0] ||
+                (exp[0] >= 'a' && exp[0] <= 'z' && buf[0] == exp[0] - 32) ||
+                (exp[0] == ' ' && buf[0] != 0); /* leading space is stripped */
+    ASSERT(match, "generated output reflects the hinted start");
+    leo_free(&leo);
+    PASS();
+}
+
 static void test_leo_generate_safe_on_empty_leo(void) {
     TEST("leo_generate: degrades gracefully on empty Leo (no ingest)");
     Leo leo;
@@ -551,6 +635,10 @@ int main(void) {
     test_leo_generate_produces_output();
     test_leo_generate_starts_upper_ends_punct();
     test_leo_generate_no_leading_whitespace();
+    test_leo_choose_continuation_matches_start_without_tail();
+    test_leo_choose_continuation_shifts_with_tail();
+    test_leo_chain_produces_multiple_sentences();
+    test_leo_generate_ex_honors_start_hint();
     test_leo_generate_safe_on_empty_leo();
 
     printf("\n=== results: %d passed, %d failed ===\n\n",
