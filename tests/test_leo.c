@@ -871,6 +871,45 @@ static void test_leo_field_trauma_pulls_bootstrap(void) {
     PASS();
 }
 
+static void test_leo_field_chambers_clamped(void) {
+    TEST("chambers: activations stay in [0,1] under heavy external drive");
+    LeoField f;
+    leo_field_init(&f, 128);
+    f.chamber_ext[LEO_CH_VOID] = 5.0f;
+    for (int i = 0; i < 50; i++)
+        leo_field_chambers_crossfire(&f, 1);
+    for (int i = 0; i < LEO_N_CHAMBERS; i++) {
+        ASSERT(f.chamber_act[i] >= 0.0f && f.chamber_act[i] <= 1.0f,
+               "chamber escaped [0,1]");
+    }
+    leo_field_free(&f);
+    PASS();
+}
+
+static void test_leo_field_chamber_mods_identity_at_zero(void) {
+    TEST("chamber α/β/γ/τ mods = 1.0 at zero activation");
+    LeoField f;
+    leo_field_init(&f, 128);
+    ASSERT(leo_field_alpha_mod(&f) == 1.0f, "alpha");
+    ASSERT(leo_field_beta_mod(&f)  == 1.0f, "beta");
+    ASSERT(leo_field_gamma_mod(&f) == 1.0f, "gamma");
+    ASSERT(leo_field_tau_mod(&f)   == 1.0f, "tau");
+    leo_field_free(&f);
+    PASS();
+}
+
+static void test_leo_field_feel_text_love(void) {
+    TEST("chambers_feel_text: 'warm hand mother' drives LOVE");
+    LeoField f;
+    leo_field_init(&f, 128);
+    leo_field_chambers_feel_text(&f, "warm hand mother");
+    ASSERT(f.chamber_ext[LEO_CH_LOVE] > 0.0f, "LOVE external raised");
+    /* FEAR should be zero (no fear words) */
+    ASSERT(f.chamber_ext[LEO_CH_FEAR] == 0.0f, "FEAR stays zero");
+    leo_field_free(&f);
+    PASS();
+}
+
 static void test_leo_field_temp_mult_velocity_modes(void) {
     TEST("leo_field_temperature_mult: modes shift base");
     LeoField f;
@@ -990,6 +1029,9 @@ int main(void) {
     test_leo_field_step_builds_destiny();
     test_leo_field_prophecy_add_and_fulfillment();
     test_leo_field_trauma_pulls_bootstrap();
+    test_leo_field_chambers_clamped();
+    test_leo_field_chamber_mods_identity_at_zero();
+    test_leo_field_feel_text_love();
     test_leo_field_temp_mult_velocity_modes();
     test_leo_respond_gravity_restored_after_call();
 

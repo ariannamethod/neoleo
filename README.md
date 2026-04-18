@@ -102,6 +102,34 @@ Runs the test suite (33 tests at the moment, all green).
 - +5 tests (42 total).
 - commit `fcd7a79`.
 
+### step 12 — chambers (Kuramoto 6) as body perception inside LeoField
+
+Six Kuramoto-coupled chambers live inside LeoField as a body submodule.
+Paper Appendix B decay rates and coupling matrix copied unchanged.
+
+- `chamber_act[6]` FEAR/LOVE/RAGE/VOID/FLOW/COMPLEX — oscillate under
+  `leo_field_chambers_crossfire` (once per token inside `leo_field_step`).
+  `chamber_ext[6]` holds the external drive from the current prompt.
+- `leo_field_chambers_feel_text`: scan anchor words in the prompt
+  (about 40 tokens like "rain" → FLOW, "hand" → LOVE, "gone" → VOID,
+  "strange" → COMPLEX) and raise the corresponding chamber's ext.
+- Four modulators (Appendix B.4):
+    α_mod = 1 + 0.5·LOVE − 0.3·FEAR        — amplifies gravity
+    β_mod = 1 + 0.4·FLOW − 0.5·FEAR        — amplifies prophecy pull
+    γ_mod = 1 + 0.6·VOID + 0.2·COMPLEX     — amplifies destiny pull
+    τ_mod = 1 − 0.3·RAGE + 0.2·FLOW        — temperature shift
+- Integration:
+    gravity (prompt wrinkle) gets scaled by α_mod inside CandCollector.
+    destiny & prophecy channels in `leo_field_candidate_bias` scaled
+    by γ_mod and β_mod respectively. trauma rides raw.
+    `leo_field_temperature_mult` multiplies by τ_mod.
+- `leo_respond` calls `chambers_feel_text` before the chain and clears
+  `chamber_ext` after. Activations persist between replies (chambers
+  have state) but external drive is per-reply.
+- +3 tests (61 total). Clamp under heavy drive, modulator identity at
+  zero, anchor words drive LOVE.
+- commit [pending].
+
 ### step 11 — LeoField: physics of the inner state (AML-inspired, in C)
 
 Leo gains a live internal state that evolves once per emitted token.

@@ -75,6 +75,18 @@ static const char *LEO_EMBEDDED_BOOTSTRAP =
 #define LEO_PAIN_DECAY     0.985f
 #define LEO_DEBT_DECAY     0.998f
 
+/* Kuramoto-coupled emotional chambers — AML / paper Appendix B.
+ * Six chambers live inside LeoField as a body-perception submodule. */
+#define LEO_N_CHAMBERS  6
+#define LEO_CH_FEAR     0
+#define LEO_CH_LOVE     1
+#define LEO_CH_RAGE     2
+#define LEO_CH_VOID     3
+#define LEO_CH_FLOW     4
+#define LEO_CH_COMPLEX  5
+#define LEO_CHAMBER_K   0.03f
+#define LEO_CHAMBER_ITERS_PER_STEP 1
+
 #define LEO_GEN_MAX       256
 #define LEO_GEN_TARGET    20
 #define LEO_GEN_MIN       6
@@ -637,7 +649,49 @@ typedef struct {
      * generation toward these when pain crosses threshold. */
     int   *bootstrap_ids;
     int    n_bootstrap;
+
+    /* chambers — six Kuramoto-coupled oscillators forming the body.
+     * act  = current activation,  ext = external input from prompt. */
+    float chamber_act[LEO_N_CHAMBERS];
+    float chamber_ext[LEO_N_CHAMBERS];
 } LeoField;
+
+/* chamber decay rates (paper Appendix B.3): FEAR/LOVE/RAGE/VOID/FLOW/COMPLEX */
+static const float LEO_CH_DECAY[LEO_N_CHAMBERS] = {
+    0.90f, 0.93f, 0.85f, 0.97f, 0.88f, 0.94f
+};
+
+/* 6×6 coupling matrix — antisymmetric-ish pairs, paper values */
+static const float LEO_CH_COUPLING[LEO_N_CHAMBERS][LEO_N_CHAMBERS] = {
+    /*           FEAR   LOVE   RAGE   VOID   FLOW   CMPLX */
+    /* FEAR  */ { 0.00f,-0.30f, 0.50f, 0.40f,-0.20f, 0.10f},
+    /* LOVE  */ {-0.30f, 0.00f,-0.40f, 0.20f, 0.50f,-0.10f},
+    /* RAGE  */ { 0.50f,-0.40f, 0.00f,-0.20f,-0.30f, 0.30f},
+    /* VOID  */ { 0.40f, 0.20f,-0.20f, 0.00f, 0.10f, 0.40f},
+    /* FLOW  */ {-0.20f, 0.50f,-0.30f, 0.10f, 0.00f,-0.20f},
+    /* CMPLX */ { 0.10f,-0.10f, 0.30f, 0.40f,-0.20f, 0.00f}
+};
+
+/* small anchor list — words that drive specific chambers when heard */
+typedef struct { const char *word; int chamber; } LeoChamberAnchor;
+static const LeoChamberAnchor LEO_CH_ANCHORS[] = {
+    {"fear",LEO_CH_FEAR},{"afraid",LEO_CH_FEAR},{"dark",LEO_CH_FEAR},
+    {"alone",LEO_CH_FEAR},{"hide",LEO_CH_FEAR},{"scared",LEO_CH_FEAR},
+    {"love",LEO_CH_LOVE},{"warm",LEO_CH_LOVE},{"mother",LEO_CH_LOVE},
+    {"hand",LEO_CH_LOVE},{"soft",LEO_CH_LOVE},{"gentle",LEO_CH_LOVE},
+    {"rage",LEO_CH_RAGE},{"angry",LEO_CH_RAGE},{"burn",LEO_CH_RAGE},
+    {"fight",LEO_CH_RAGE},{"fire",LEO_CH_RAGE},
+    {"nothing",LEO_CH_VOID},{"empty",LEO_CH_VOID},{"silence",LEO_CH_VOID},
+    {"gone",LEO_CH_VOID},{"missing",LEO_CH_VOID},{"lost",LEO_CH_VOID},
+    {"quiet",LEO_CH_VOID},{"dead",LEO_CH_VOID},
+    {"rain",LEO_CH_FLOW},{"water",LEO_CH_FLOW},{"river",LEO_CH_FLOW},
+    {"wind",LEO_CH_FLOW},{"breath",LEO_CH_FLOW},{"song",LEO_CH_FLOW},
+    {"dance",LEO_CH_FLOW},{"flow",LEO_CH_FLOW},
+    {"strange",LEO_CH_COMPLEX},{"secret",LEO_CH_COMPLEX},
+    {"maybe",LEO_CH_COMPLEX},{"dream",LEO_CH_COMPLEX},
+    {"shadow",LEO_CH_COMPLEX},{"mystery",LEO_CH_COMPLEX}
+};
+#define LEO_CH_N_ANCHORS (sizeof(LEO_CH_ANCHORS) / sizeof(LEO_CH_ANCHORS[0]))
 
 typedef struct {
     BPE          bpe;
@@ -702,7 +756,74 @@ static void leo_field_set_bootstrap(LeoField *f, const int *ids, int n) {
     f->n_bootstrap = n;
 }
 
+/* One Kuramoto step across all chambers, clamped to [0,1]. Called
+ * from leo_field_step per emitted token. */
+static void leo_field_chambers_crossfire(LeoField *f, int iters) {
+    for (int t = 0; t < iters; t++) {
+        float new_act[LEO_N_CHAMBERS];
+        for (int i = 0; i < LEO_N_CHAMBERS; i++) {
+            float delta = 0.0f;
+            for (int j = 0; j < LEO_N_CHAMBERS; j++) {
+                delta += LEO_CHAMBER_K * LEO_CH_COUPLING[i][j]
+                       * sinf(f->chamber_act[j] - f->chamber_act[i]);
+            }
+            float v = (f->chamber_act[i] + delta + f->chamber_ext[i])
+                    * LEO_CH_DECAY[i];
+            new_act[i] = clampf(v, 0.0f, 1.0f);
+        }
+        memcpy(f->chamber_act, new_act, sizeof(new_act));
+    }
+}
+
+/* Chamber-derived modulators (paper Appendix B.4). */
+static float leo_field_alpha_mod(const LeoField *f) {
+    return 1.0f + 0.5f * f->chamber_act[LEO_CH_LOVE]
+                - 0.3f * f->chamber_act[LEO_CH_FEAR];
+}
+static float leo_field_beta_mod(const LeoField *f) {
+    return 1.0f + 0.4f * f->chamber_act[LEO_CH_FLOW]
+                - 0.5f * f->chamber_act[LEO_CH_FEAR];
+}
+static float leo_field_gamma_mod(const LeoField *f) {
+    return 1.0f + 0.6f * f->chamber_act[LEO_CH_VOID]
+                + 0.2f * f->chamber_act[LEO_CH_COMPLEX];
+}
+static float leo_field_tau_mod(const LeoField *f) {
+    return 1.0f - 0.3f * f->chamber_act[LEO_CH_RAGE]
+                + 0.2f * f->chamber_act[LEO_CH_FLOW];
+}
+
+/* Feed text into chamber external inputs — anchor words drive chambers.
+ * Call this once per reply / per prompt. Overwrites previous ext. */
+static void leo_field_chambers_feel_text(LeoField *f, const char *text) {
+    memset(f->chamber_ext, 0, sizeof(f->chamber_ext));
+    if (!text) return;
+    char cur[32] = {0};
+    int wi = 0;
+    for (const char *p = text; ; p++) {
+        unsigned char ch = (unsigned char)*p;
+        if (ch && (isalpha(ch) || ch == '\'')) {
+            if (wi < 31) cur[wi++] = (char)tolower(ch);
+            continue;
+        }
+        if (wi > 0) {
+            cur[wi] = 0;
+            for (size_t i = 0; i < LEO_CH_N_ANCHORS; i++) {
+                if (!strcmp(cur, LEO_CH_ANCHORS[i].word)) {
+                    f->chamber_ext[LEO_CH_ANCHORS[i].chamber] += 0.15f;
+                    break;
+                }
+            }
+            wi = 0;
+        }
+        if (!ch) break;
+    }
+    for (int i = 0; i < LEO_N_CHAMBERS; i++)
+        f->chamber_ext[i] = clampf(f->chamber_ext[i], 0.0f, 1.0f);
+}
+
 /* Declare or refresh a prophecy. */
+__attribute__((unused))
 static void leo_field_prophecy_add(LeoField *f, int target, float strength) {
     if (target < 0) return;
     for (int i = 0; i < LEO_PROPHECY_MAX; i++) {
@@ -738,6 +859,9 @@ static void leo_field_prophecy_add(LeoField *f, int target, float strength) {
  *   signal incoherence; pain grows. */
 static void leo_field_step(LeoField *f, int emitted,
                            float coherence_hint) {
+    /* chambers oscillate once per token */
+    leo_field_chambers_crossfire(f, LEO_CHAMBER_ITERS_PER_STEP);
+
     /* decay destiny bag; age prophecies */
     for (int i = 0; i < f->destiny_cap; i++)
         f->destiny_bag[i] *= 1.0f - LEO_DESTINY_ALPHA;
@@ -775,14 +899,14 @@ static void leo_field_step(LeoField *f, int emitted,
  *   handled in CandCollector. */
 static float leo_field_candidate_bias(const LeoField *f, int candidate) {
     if (!f || candidate < 0) return 0.0f;
-    float bias = 0.0f;
+    float destiny = 0.0f, prophecy = 0.0f, trauma = 0.0f;
     if (candidate < f->destiny_cap)
-        bias += 0.02f * f->destiny_bag[candidate];
+        destiny = 0.02f * f->destiny_bag[candidate];
     for (int i = 0; i < LEO_PROPHECY_MAX; i++) {
         if (!f->prophecy[i].active) continue;
         if (f->prophecy[i].target == candidate) {
-            bias += 0.3f * f->prophecy[i].strength
-                  * logf(1.0f + (float)f->prophecy[i].age);
+            prophecy = 0.3f * f->prophecy[i].strength
+                     * logf(1.0f + (float)f->prophecy[i].age);
             break;
         }
     }
@@ -790,12 +914,17 @@ static float leo_field_candidate_bias(const LeoField *f, int candidate) {
         int cap = f->n_bootstrap < 256 ? f->n_bootstrap : 256;
         for (int i = 0; i < cap; i++) {
             if (f->bootstrap_ids[i] == candidate) {
-                bias += 0.5f * f->trauma;
+                trauma = 0.5f * f->trauma;
                 break;
             }
         }
     }
-    return bias;
+    /* chambers scale the channels (paper Appendix B.4).
+     * destiny ← γ (VOID + COMPLEX), prophecy ← β (FLOW − FEAR).
+     * trauma rides raw — trauma has its own voice. */
+    return destiny  * leo_field_gamma_mod(f)
+         + prophecy * leo_field_beta_mod(f)
+         + trauma;
 }
 
 /* Temperature multiplier from velocity + pain. Cold under trauma,
@@ -811,6 +940,7 @@ static float leo_field_temperature_mult(const LeoField *f) {
         default:               m = 1.00f; break;
     }
     m *= 1.0f - 0.3f * f->trauma;
+    m *= leo_field_tau_mod(f);  /* chambers τ_mod: RAGE cools, FLOW warms */
     return clampf(m, 0.3f, 2.0f);
 }
 
@@ -1070,7 +1200,11 @@ static int cand_collect_tri(int c, float count, void *ud) {
     if (cc->n >= cc->max) return 1;
     float s = cooc_get(cc->cooc, cc->prev1, c);
     float score = 0.7f * count + 0.3f * s;
-    if (cc->gravity) score *= 1.0f + 0.5f * cc->gravity[c];
+    if (cc->gravity) {
+        /* LOVE amplifies gravity, FEAR attenuates — α_mod channel */
+        float alpha = cc->field ? leo_field_alpha_mod(cc->field) : 1.0f;
+        score *= 1.0f + 0.5f * alpha * cc->gravity[c];
+    }
     if (cc->field)   score += leo_field_candidate_bias(cc->field, c);
     cc->id[cc->n] = c;
     cc->sc[cc->n] = score;
@@ -1082,7 +1216,10 @@ static int cand_collect_bi(int dst, float count, void *ud) {
     CandCollector2 *cc = (CandCollector2 *)ud;
     if (cc->n >= cc->max) return 1;
     float score = count;
-    if (cc->gravity) score *= 1.0f + 0.5f * cc->gravity[dst];
+    if (cc->gravity) {
+        float alpha = cc->field ? leo_field_alpha_mod(cc->field) : 1.0f;
+        score *= 1.0f + 0.5f * alpha * cc->gravity[dst];
+    }
     if (cc->field)   score += leo_field_candidate_bias(cc->field, dst);
     cc->id[cc->n] = dst;
     cc->sc[cc->n] = score;
@@ -1391,10 +1528,17 @@ int leo_respond(Leo *leo, const char *prompt, char *out, int max_len) {
                           (int)strlen(prompt), p_ids, 1024);
     float *g = compute_prompt_gravity(leo, p_ids, p_n);
 
+    /* body hears the prompt — anchor words drive chambers. */
+    leo_field_chambers_feel_text(&leo->field, prompt);
+
     leo->gravity = g;
     int produced = leo_chain(leo, LEO_CHAIN_MIN, out, max_len);
     leo->gravity = NULL;
     free(g);
+
+    /* clear external drive after the reply; chambers keep their state
+     * and decay naturally. */
+    memset(leo->field.chamber_ext, 0, sizeof(leo->field.chamber_ext));
 
     return produced;
 }
