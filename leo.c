@@ -36,6 +36,15 @@
 #define LEO_CHAIN_MAX     12
 #define LEO_TAIL_WIN      8    /* how many final tokens of a sentence flow into next */
 
+/* SPA — sentence phonon attention. Tokens are atoms, sentences are phonons.
+ * Each token gets a random 32-dim fingerprint (not learned). A sentence
+ * embedding is the exp-weighted mean of its tokens' fingerprints. Bidirectional
+ * cross-attention between sentences scores their "connectedness". The
+ * sentence with the lowest score falls out of resonance and is reseeded. */
+#define LEO_SPA_DIM       32
+#define LEO_SPA_ALPHA     0.85f
+#define LEO_SPA_RESEED_FL 0.52f  /* below avg * this → reseed */
+
 /* ========================================================================
  * MATH UTILITIES
  * ======================================================================== */
@@ -859,41 +868,172 @@ int leo_generate(Leo *leo, char *out, int max_len) {
     return leo_generate_ex(leo, out, max_len, -1, NULL, 0, NULL, NULL);
 }
 
+/* ---- SPA: random 32-dim token fingerprints, sentence embeddings,
+ * bidirectional cross-attention, reseed detector. ---- */
+
+typedef struct {
+    float *W;          /* [vocab_size * LEO_SPA_DIM] — random, not learned */
+    int    vocab_size;
+} SPACtx;
+
+static void spa_init(SPACtx *s, int vocab_size) {
+    s->vocab_size = vocab_size;
+    s->W = calloc((size_t)vocab_size * LEO_SPA_DIM, sizeof(float));
+    for (int i = 0; i < vocab_size; i++) {
+        for (int d = 0; d < LEO_SPA_DIM; d++) {
+            float r = (float)rand() / (float)RAND_MAX - 0.5f;
+            s->W[i * LEO_SPA_DIM + d] = 0.05f * r;
+        }
+    }
+}
+
+static void spa_free(SPACtx *s) {
+    free(s->W); s->W = NULL; s->vocab_size = 0;
+}
+
+/* Exp-weighted mean of token fingerprints, normalized. Recent tokens
+ * contribute more (alpha^(N-1-i)). */
+static void spa_embed_sentence(const SPACtx *s, const int *ids, int n,
+                               float out[LEO_SPA_DIM]) {
+    memset(out, 0, LEO_SPA_DIM * sizeof(float));
+    if (n <= 0) return;
+    float total_w = 0;
+    for (int i = 0; i < n; i++) {
+        float w = powf(LEO_SPA_ALPHA, (float)(n - 1 - i));
+        int id = ids[i];
+        if (id < 0 || id >= s->vocab_size) continue;
+        for (int d = 0; d < LEO_SPA_DIM; d++)
+            out[d] += w * s->W[id * LEO_SPA_DIM + d];
+        total_w += w;
+    }
+    if (total_w > 0) for (int d = 0; d < LEO_SPA_DIM; d++) out[d] /= total_w;
+    float norm = 0;
+    for (int d = 0; d < LEO_SPA_DIM; d++) norm += out[d] * out[d];
+    norm = 1.0f / sqrtf(norm + 1e-8f);
+    for (int d = 0; d < LEO_SPA_DIM; d++) out[d] *= norm;
+}
+
+/* Bidirectional cross-attention score per sentence: high score = sentence
+ * resonates with the others. Distance bias prefers neighbours. */
+static void spa_cross_attend(const float embs[][LEO_SPA_DIM], int S,
+                             float scores[]) {
+    float inv_sqrt = 1.0f / sqrtf((float)LEO_SPA_DIM);
+    for (int i = 0; i < S; i++) {
+        float total = 0;
+        for (int j = 0; j < S; j++) {
+            if (i == j) continue;
+            float dot = 0;
+            for (int d = 0; d < LEO_SPA_DIM; d++)
+                dot += embs[i][d] * embs[j][d];
+            dot *= inv_sqrt;
+            int dist = i > j ? i - j : j - i;
+            float r_bias = 0.1f / (1.0f + (float)dist);
+            total += expf(dot + r_bias);
+        }
+        scores[i] = total;
+    }
+}
+
 /* Chain generation: emit `n_sentences` sentences with cooc-driven
- * semantic continuity. Each next sentence's start is biased by the
- * tail of the previous one.  Writes a single blob of text separated
- * by spaces into `out`. Returns total tokens emitted across all
- * sentences. */
+ * semantic continuity, then a SPA pass — the sentence that falls out of
+ * resonance with the rest gets reseeded from its neighbour's tail.
+ * Writes a single blob of text separated by spaces into `out`. Returns
+ * total tokens emitted across all sentences. */
 int leo_chain(Leo *leo, int n_sentences, char *out, int max_len) {
     if (!out || max_len < 2) return 0;
     if (n_sentences < 1) n_sentences = 1;
     if (n_sentences > LEO_CHAIN_MAX) n_sentences = LEO_CHAIN_MAX;
 
-    int total = 0;
-    int pos = 0;
-    out[0] = 0;
+    /* per-sentence storage so SPA can re-embed and reseed */
+    int  sent_ids[LEO_CHAIN_MAX][LEO_GEN_MAX];
+    int  sent_len[LEO_CHAIN_MAX];
+    char sent_text[LEO_CHAIN_MAX][1024];
+    int  total = 0;
 
+    /* pass 1: generate chain, remember both bytes and tail tokens */
     int tail[LEO_TAIL_WIN];
     int tail_len = 0;
 
     for (int s = 0; s < n_sentences; s++) {
-        char sent[1024];
-        int  cap = LEO_TAIL_WIN;
-        int  produced = leo_generate_ex(
-            leo, sent, sizeof(sent),
+        int cap = LEO_TAIL_WIN;
+        /* reuse emitted_tail as the sentence token record too — but we
+         * need *all* tokens of the sentence for SPA embedding, not just
+         * the tail. We do a helper generation that records everything. */
+        int  produced = 0;
+        int  tok_cap = LEO_GEN_MAX;
+        int *tok_buf = sent_ids[s];
+        /* temporarily set cap to full LEO_GEN_MAX so emitted_tail receives
+         * the full token list (truncated at tail window inside _ex is just
+         * a copy — we want more). We extend leo_generate_ex to cope with
+         * larger emitted buffers: it copies min(n, cap) trailing tokens.
+         * By setting cap = LEO_GEN_MAX we effectively get the full context. */
+        produced = leo_generate_ex(
+            leo, sent_text[s], sizeof(sent_text[s]),
             /*start_hint*/ -1,
             /*tail*/ s == 0 ? NULL : tail,
             /*n_tail*/ s == 0 ? 0 : tail_len,
-            /*emitted_tail*/ tail,
-            /*n_emit*/ &cap);
-        tail_len = cap;
+            /*emitted_tail*/ tok_buf,
+            /*n_emit*/ &tok_cap);
+        sent_len[s] = tok_cap;
         total += produced;
 
-        int slen = (int)strlen(sent);
+        /* copy last LEO_TAIL_WIN into tail for next-sentence continuation */
+        int take = tok_cap > LEO_TAIL_WIN ? LEO_TAIL_WIN : tok_cap;
+        int src_start = tok_cap - take;
+        for (int i = 0; i < take; i++) tail[i] = tok_buf[src_start + i];
+        tail_len = take;
+    }
+
+    /* pass 2: SPA — find the outlier, reseed it */
+    SPACtx spa;
+    spa_init(&spa, leo->bpe.vocab_size);
+
+    for (int pass = 0; pass < 2; pass++) {
+        float embs[LEO_CHAIN_MAX][LEO_SPA_DIM];
+        float scores[LEO_CHAIN_MAX];
+        for (int i = 0; i < n_sentences; i++)
+            spa_embed_sentence(&spa, sent_ids[i], sent_len[i], embs[i]);
+        spa_cross_attend(embs, n_sentences, scores);
+
+        float sum = 0, min_sc = scores[0]; int weak = 0;
+        for (int i = 0; i < n_sentences; i++) {
+            sum += scores[i];
+            if (scores[i] < min_sc) { min_sc = scores[i]; weak = i; }
+        }
+        float avg = sum / (float)n_sentences;
+        if (min_sc >= avg * LEO_SPA_RESEED_FL) break;   /* no outlier */
+
+        /* reseed the weak sentence using the tail of a neighbour */
+        int src = weak > 0 ? weak - 1 : weak + 1;
+        if (src < 0 || src >= n_sentences) continue;
+        int ntail = sent_len[src] > LEO_TAIL_WIN ? LEO_TAIL_WIN : sent_len[src];
+        int start_src = sent_len[src] - ntail;
+        int ntail_buf[LEO_TAIL_WIN];
+        for (int i = 0; i < ntail; i++) ntail_buf[i] = sent_ids[src][start_src + i];
+
+        int new_cap = LEO_GEN_MAX;
+        int produced = leo_generate_ex(
+            leo, sent_text[weak], sizeof(sent_text[weak]),
+            /*start_hint*/ -1,
+            /*tail*/ ntail_buf,
+            /*n_tail*/ ntail,
+            /*emitted_tail*/ sent_ids[weak],
+            /*n_emit*/ &new_cap);
+        sent_len[weak] = new_cap;
+        total += produced;
+    }
+
+    spa_free(&spa);
+
+    /* assemble output */
+    int pos = 0;
+    out[0] = 0;
+    for (int s = 0; s < n_sentences; s++) {
+        int slen = (int)strlen(sent_text[s]);
         if (slen == 0) continue;
         if (pos > 0 && pos + 1 < max_len) out[pos++] = ' ';
         if (pos + slen >= max_len - 1) { out[pos] = 0; break; }
-        memcpy(out + pos, sent, slen);
+        memcpy(out + pos, sent_text[s], slen);
         pos += slen;
         out[pos] = 0;
     }

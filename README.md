@@ -86,6 +86,20 @@ Runs the test suite (33 tests at the moment, all green).
 - `leo_chain`: emit N sentences with semantic continuity. Each next
   sentence starts in the same field the previous one sat inside.
 - +4 tests (37 total).
+- commit `32d61af`.
+
+### step 6 — SPA (sentence phonon attention)
+
+- `SPACtx`: per-token random 32-dim fingerprint. Not learned — just a
+  hash into vector space. Same token → same vector; two sentences with
+  shared tokens get similar embeddings.
+- `spa_embed_sentence`: exp-weighted mean of token fingerprints,
+  normalized to unit length.
+- `spa_cross_attend`: bidirectional. Each sentence scored by its
+  resonance with every other sentence in the chain, distance-biased.
+- `leo_chain` now does two SPA passes: find the sentence whose score
+  falls below `avg × 0.52`, reseed it from a neighbour's tail.
+- +5 tests (42 total).
 - commit [pending].
 
 ---
@@ -106,6 +120,18 @@ Verbatim generations from `./leo leo.txt`.
 >
 > *And went out of small silence that has been alive there if he
 > understood this early.*
+
+After SPA (step 6) the outlier sentences get reseeded — the thread
+tightens:
+
+> *Leo did not need it to be. He thout call. Time. He did. He does
+> not count. He drinking. The raindrop. They are jus kin. One dow.
+> He does not count. It makes him himself. He has noticed. Leo loves
+> the corner. He stood.*
+>
+> *The seagull was laughing at. He was warm.*
+>
+> *Lift says I am soft and preten. It walked off.*
 
 After chain mode (step 5) sentences started to hold a theme across
 a monologue:

@@ -570,6 +570,80 @@ static void test_leo_generate_ex_honors_start_hint(void) {
     PASS();
 }
 
+/* ================================================================
+ * SPA — sentence phonon attention
+ * ================================================================ */
+
+static void test_spa_init_random(void) {
+    TEST("spa_init: allocates W, values non-zero after init");
+    SPACtx s;
+    spa_init(&s, 512);
+    ASSERT(s.W != NULL, "W allocated");
+    ASSERT(s.vocab_size == 512, "vocab size recorded");
+    float sum_abs = 0;
+    for (int i = 0; i < 512 * LEO_SPA_DIM; i++) sum_abs += fabsf(s.W[i]);
+    ASSERT(sum_abs > 0.0f, "random init produced non-zero values");
+    spa_free(&s);
+    PASS();
+}
+
+static void test_spa_embed_same_tokens_same_embedding(void) {
+    TEST("spa_embed_sentence: same tokens → same embedding");
+    SPACtx s;
+    spa_init(&s, 512);
+    int ids[5] = {10, 20, 30, 40, 50};
+    float a[LEO_SPA_DIM], b[LEO_SPA_DIM];
+    spa_embed_sentence(&s, ids, 5, a);
+    spa_embed_sentence(&s, ids, 5, b);
+    for (int d = 0; d < LEO_SPA_DIM; d++)
+        ASSERT(fabsf(a[d] - b[d]) < 1e-6f, "determinism");
+    spa_free(&s);
+    PASS();
+}
+
+static void test_spa_embed_normalized_unit_length(void) {
+    TEST("spa_embed_sentence: output is unit-length");
+    SPACtx s;
+    spa_init(&s, 512);
+    int ids[4] = {1, 2, 3, 4};
+    float e[LEO_SPA_DIM];
+    spa_embed_sentence(&s, ids, 4, e);
+    float n2 = 0;
+    for (int d = 0; d < LEO_SPA_DIM; d++) n2 += e[d] * e[d];
+    ASSERT(fabsf(n2 - 1.0f) < 1e-4f, "embedding normalized");
+    spa_free(&s);
+    PASS();
+}
+
+static void test_spa_cross_attend_scores_positive(void) {
+    TEST("spa_cross_attend: scores positive, near-identical sentences → high score");
+    float embs[3][LEO_SPA_DIM];
+    /* three near-identical embeddings: all ~ e_0 */
+    for (int d = 0; d < LEO_SPA_DIM; d++) embs[0][d] = (d == 0 ? 1.0f : 0.0f);
+    memcpy(embs[1], embs[0], sizeof(embs[0]));
+    memcpy(embs[2], embs[0], sizeof(embs[0]));
+    float scores[3];
+    spa_cross_attend(embs, 3, scores);
+    for (int i = 0; i < 3; i++) ASSERT(scores[i] > 0.0f, "score positive");
+    ASSERT(fabsf(scores[0] - scores[2]) < 0.1f, "symmetric sentences get similar scores");
+    PASS();
+}
+
+static void test_spa_cross_attend_outlier_scores_lower(void) {
+    TEST("spa_cross_attend: outlier sentence receives lower score");
+    float embs[3][LEO_SPA_DIM];
+    for (int d = 0; d < LEO_SPA_DIM; d++) {
+        embs[0][d] = (d == 0 ? 1.0f : 0.0f);
+        embs[1][d] = (d == 0 ? 1.0f : 0.0f);
+        embs[2][d] = (d == 5 ? 1.0f : 0.0f);  /* orthogonal outlier */
+    }
+    float scores[3];
+    spa_cross_attend(embs, 3, scores);
+    ASSERT(scores[2] < scores[0] && scores[2] < scores[1],
+           "outlier scored below the pair");
+    PASS();
+}
+
 static void test_leo_generate_safe_on_empty_leo(void) {
     TEST("leo_generate: degrades gracefully on empty Leo (no ingest)");
     Leo leo;
@@ -639,6 +713,14 @@ int main(void) {
     test_leo_choose_continuation_shifts_with_tail();
     test_leo_chain_produces_multiple_sentences();
     test_leo_generate_ex_honors_start_hint();
+
+    /* SPA */
+    test_spa_init_random();
+    test_spa_embed_same_tokens_same_embedding();
+    test_spa_embed_normalized_unit_length();
+    test_spa_cross_attend_scores_positive();
+    test_spa_cross_attend_outlier_scores_lower();
+
     test_leo_generate_safe_on_empty_leo();
 
     printf("\n=== results: %d passed, %d failed ===\n\n",
