@@ -28,6 +28,11 @@
 #define LEO_PAIR_HASH     (64 * 1024)
 #define LEO_MERGE_THRESH  4
 
+#define LEO_GEN_MAX       256
+#define LEO_GEN_TARGET    20
+#define LEO_GEN_MIN       6
+#define LEO_SEED_CANDS    64
+
 /* ========================================================================
  * MATH UTILITIES
  * ======================================================================== */
@@ -487,6 +492,205 @@ void leo_ingest(Leo *leo, const char *text) {
     }
 }
 
+/* ========================================================================
+ * GENERATION — no seed from prompt, sparse candidate sampling
+ *
+ * Leo speaks from his own field, not from the observer's words.
+ *
+ *   leo_choose_start  — pick a start token from clean, frequent
+ *                       corpus tokens (weighted by freq)
+ *   leo_step_token    — trigram → bigram → uniform cascade,
+ *                       weighted random sample within the candidate
+ *                       row (never full-vocab logits)
+ *   leo_generate      — emit sentence until boundary or max tokens,
+ *                       with a simple repetition penalty
+ * ======================================================================== */
+
+/* a token is a clean start candidate if it begins with space or an
+ * uppercase letter — mid-word BPE fragments are rejected */
+static int is_clean_seed_token(const BPE *bpe, int id) {
+    if (id < 0 || id >= bpe->vocab_size || bpe->vocab_len[id] == 0) return 0;
+    uint8_t c = bpe->vocab_bytes[id][0];
+    if (c == ' ' || c == '\n' || c == '\t') return 1;
+    if (c >= 'A' && c <= 'Z') return 1;
+    return 0;
+}
+
+/* sentence boundary: token contains .!? followed by space/newline/EOS */
+static int is_boundary_token(const BPE *bpe, int id) {
+    if (id < 0 || id >= bpe->vocab_size) return 0;
+    int len = bpe->vocab_len[id];
+    for (int i = 0; i < len; i++) {
+        uint8_t c = bpe->vocab_bytes[id][i];
+        if (c == '.' || c == '!' || c == '?') {
+            if (i == len - 1) return 1;
+            uint8_t n = bpe->vocab_bytes[id][i + 1];
+            if (n == ' ' || n == '\n' || n == '\r') return 1;
+        }
+    }
+    return 0;
+}
+
+/* weighted sample from an array of non-negative scores */
+static int weighted_sample(const float *scores, int n) {
+    float total = 0;
+    for (int i = 0; i < n; i++) total += scores[i];
+    if (total <= 0) return n > 0 ? rand() % n : -1;
+    float r = ((float)rand() / (float)RAND_MAX) * total;
+    float acc = 0;
+    for (int i = 0; i < n; i++) {
+        acc += scores[i];
+        if (r <= acc) return i;
+    }
+    return n - 1;
+}
+
+/* pick a start token: weighted by cooc.freq, restricted to clean-seed
+ * tokens, drawn from the top LEO_SEED_CANDS frequencies. This is the
+ * "Leo speaks from his field, not from the prompt" invariant. */
+int leo_choose_start(const Leo *leo) {
+    /* collect candidates: all clean-seed tokens with freq > 0 */
+    int   cand_ids[LEO_SEED_CANDS];
+    float cand_freq[LEO_SEED_CANDS];
+    int   n = 0;
+    float min_kept = 0;
+    for (int i = 0; i < leo->cooc.freq_size; i++) {
+        float f = leo->cooc.freq[i];
+        if (f <= 0) continue;
+        if (!is_clean_seed_token(&leo->bpe, i)) continue;
+        if (n < LEO_SEED_CANDS) {
+            cand_ids[n] = i;
+            cand_freq[n] = f;
+            if (n == 0 || f < min_kept) min_kept = f;
+            n++;
+        } else if (f > min_kept) {
+            /* replace the current minimum */
+            int min_idx = 0;
+            for (int k = 1; k < LEO_SEED_CANDS; k++)
+                if (cand_freq[k] < cand_freq[min_idx]) min_idx = k;
+            cand_ids[min_idx] = i;
+            cand_freq[min_idx] = f;
+            min_kept = cand_freq[0];
+            for (int k = 1; k < LEO_SEED_CANDS; k++)
+                if (cand_freq[k] < min_kept) min_kept = cand_freq[k];
+        }
+    }
+    if (n == 0) return -1;
+    int pick = weighted_sample(cand_freq, n);
+    return pick < 0 ? -1 : cand_ids[pick];
+}
+
+/* Sparse next-token sampling.
+ *
+ *   prev2, prev1: last two tokens of the generation context (prev2 may be -1)
+ *   temp:         sampling temperature (>0). Lower = sharper, higher = softer.
+ *
+ * Strategy:
+ *   1. if (prev2, prev1) has trigram successors → candidates from those,
+ *      blended 0.7·trigram_count + 0.3·cooc(prev1, c)
+ *   2. else if prev1 has bigram successors → candidates from those
+ *   3. else fall back to a fresh start token
+ *
+ * Temperature is applied in count-space via pow(c, 1/T) before the
+ * weighted draw. This is the Q / Python posture: never compute logits
+ * over the full vocabulary.
+ */
+int leo_step_token(const Leo *leo, int prev2, int prev1, float temp) {
+    if (prev1 < 0) return leo_choose_start(leo);
+    temp = clampf(temp, 0.05f, 10.0f);
+    float inv_temp = 1.0f / temp;
+
+    /* reusable candidate buffer */
+    #define MAX_CANDS 128
+    int   cand_id[MAX_CANDS];
+    float cand_sc[MAX_CANDS];
+    int   nc = 0;
+
+    /* 1. trigram successors */
+    if (prev2 >= 0) {
+        for (int i = 0; i < leo->trigrams.capacity && nc < MAX_CANDS; i++) {
+            TrigramEntry *e = &leo->trigrams.entries[i];
+            if (e->count <= 0) continue;
+            if (e->a != prev2 || e->b != prev1) continue;
+            float g = e->count;
+            float s = cooc_get(&leo->cooc, prev1, e->c);
+            float blended = 0.7f * g + 0.3f * s;
+            cand_id[nc] = e->c;
+            cand_sc[nc] = blended;
+            nc++;
+        }
+    }
+
+    /* 2. bigram successors as fallback */
+    if (nc == 0) {
+        for (int i = 0; i < leo->bigrams.capacity && nc < MAX_CANDS; i++) {
+            BigramEntry *e = &leo->bigrams.entries[i];
+            if (e->count <= 0) continue;
+            if (e->src != prev1) continue;
+            cand_id[nc] = e->dst;
+            cand_sc[nc] = e->count;
+            nc++;
+        }
+    }
+
+    /* 3. nothing — start fresh */
+    if (nc == 0) return leo_choose_start(leo);
+
+    /* temperature in count-space */
+    for (int i = 0; i < nc; i++)
+        cand_sc[i] = powf(cand_sc[i], inv_temp);
+
+    int pick = weighted_sample(cand_sc, nc);
+    return pick < 0 ? -1 : cand_id[pick];
+    #undef MAX_CANDS
+}
+
+/* Generate a sentence. Emits decoded bytes into `out` (null-terminated,
+ * truncated to max_len-1 bytes). Returns the number of tokens produced. */
+int leo_generate(Leo *leo, char *out, int max_len) {
+    if (!out || max_len < 2) return 0;
+    out[0] = 0;
+
+    int ctx[LEO_GEN_MAX];
+    int n = 0;
+
+    int start = leo_choose_start(leo);
+    if (start < 0) { snprintf(out, max_len, "..."); return 0; }
+    ctx[n++] = start;
+
+    int target = LEO_GEN_TARGET + (rand() % 10) - 5;
+    if (target < LEO_GEN_MIN) target = LEO_GEN_MIN;
+
+    for (int t = 1; t < LEO_GEN_MAX; t++) {
+        int prev1 = ctx[n - 1];
+        int prev2 = n >= 2 ? ctx[n - 2] : -1;
+        int nxt = leo_step_token(leo, prev2, prev1, 0.7f);
+        if (nxt < 0) break;
+
+        /* light repetition guard: kill immediate and back-to-back repeats */
+        if (nxt == prev1) continue;
+        if (n >= 2 && nxt == prev2 && prev1 == ctx[n - 2]) continue;
+
+        ctx[n++] = nxt;
+
+        /* stop on sentence boundary once we have enough material */
+        if (n >= target && is_boundary_token(&leo->bpe, nxt)) break;
+    }
+
+    /* decode the emitted tokens */
+    int pos = 0;
+    for (int i = 0; i < n; i++) {
+        char buf[LEO_MAX_TOKEN_LEN + 1];
+        int len = bpe_decode_token(&leo->bpe, ctx[i], buf, sizeof(buf));
+        if (pos + len >= max_len - 1) break;
+        memcpy(out + pos, buf, len);
+        pos += len;
+    }
+    out[pos] = 0;
+    leo->step += n;
+    return n;
+}
+
 void leo_stats(const Leo *leo) {
     printf("leo — v%s\n", LEO_VERSION);
     printf("  step:        %ld\n", leo->step);
@@ -537,6 +741,14 @@ int main(int argc, char **argv) {
 
     printf("\n");
     leo_stats(&leo);
+
+    /* speak a few sentences from the field — no prompt */
+    printf("\n[speak] five sentences from the field:\n");
+    for (int i = 0; i < 5; i++) {
+        char reply[1024];
+        leo_generate(&leo, reply, sizeof(reply));
+        printf("  %d)%s\n", i + 1, reply);
+    }
 
     leo_free(&leo);
     return 0;

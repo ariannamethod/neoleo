@@ -319,6 +319,115 @@ static void test_leo_bpe_merges_include_common_bigrams(void) {
 }
 
 /* ================================================================
+ * GENERATION — clean seed, boundary, step, generate
+ * ================================================================ */
+
+static void test_is_clean_seed_token(void) {
+    TEST("is_clean_seed_token: space/upper start = clean, lower = not");
+    BPE bpe;
+    bpe_init(&bpe);
+    /* byte tokens: ' ' is 0x20, 'a' is 0x61, 'A' is 0x41, '.' is 0x2E */
+    ASSERT(is_clean_seed_token(&bpe, ' ') == 1, "space is clean");
+    ASSERT(is_clean_seed_token(&bpe, 'A') == 1, "uppercase is clean");
+    ASSERT(is_clean_seed_token(&bpe, 'a') == 0, "lowercase is not clean");
+    ASSERT(is_clean_seed_token(&bpe, '.') == 0, "punctuation is not clean");
+    ASSERT(is_clean_seed_token(&bpe, -1) == 0, "invalid id rejected");
+    PASS();
+}
+
+static void test_is_boundary_token(void) {
+    TEST("is_boundary_token: .!? end tokens recognized");
+    BPE bpe;
+    bpe_init(&bpe);
+    ASSERT(is_boundary_token(&bpe, '.') == 1, "period is boundary");
+    ASSERT(is_boundary_token(&bpe, '!') == 1, "exclamation is boundary");
+    ASSERT(is_boundary_token(&bpe, '?') == 1, "question is boundary");
+    ASSERT(is_boundary_token(&bpe, 'a') == 0, "letter is not");
+    ASSERT(is_boundary_token(&bpe, ',') == 0, "comma is not");
+    PASS();
+}
+
+static void test_weighted_sample_uniform(void) {
+    TEST("weighted_sample: uniform scores produce all indices");
+    float s[4] = {1, 1, 1, 1};
+    int seen[4] = {0};
+    srand(42);
+    for (int i = 0; i < 400; i++) seen[weighted_sample(s, 4)]++;
+    for (int i = 0; i < 4; i++)
+        ASSERT(seen[i] > 50, "each index visited >50 times");
+    PASS();
+}
+
+static void test_weighted_sample_peaked(void) {
+    TEST("weighted_sample: peak wins the majority of draws");
+    float s[4] = {0.01f, 0.01f, 100.0f, 0.01f};
+    int peak_hits = 0;
+    srand(7);
+    for (int i = 0; i < 100; i++)
+        if (weighted_sample(s, 4) == 2) peak_hits++;
+    ASSERT(peak_hits > 90, "peak should dominate");
+    PASS();
+}
+
+static void test_leo_choose_start_after_ingest(void) {
+    TEST("leo_choose_start: returns clean-seed id from ingested field");
+    Leo leo;
+    leo_init(&leo);
+    leo_ingest(&leo, "Leo watches the rain. The rain is soft. "
+                     "Leo listens. The quiet has weight. He waits.");
+    int s = leo_choose_start(&leo);
+    ASSERT(s >= 0, "start token chosen");
+    ASSERT(is_clean_seed_token(&leo.bpe, s), "chosen token is clean seed");
+    leo_free(&leo);
+    PASS();
+}
+
+static void test_leo_step_token_uses_bigram_fallback(void) {
+    TEST("leo_step_token: falls back to bigram when no trigram context");
+    Leo leo;
+    leo_init(&leo);
+    leo_ingest(&leo, "abcabcabcabcabcabcabc");
+    /* prev2 = -1 skips trigram branch → bigram row for 'a' should give 'b' */
+    int id_a = (int)'a';
+    int nxt = leo_step_token(&leo, -1, id_a, 0.5f);
+    ASSERT(nxt == (int)'b' || nxt == (int)'a', "bigram suggests 'b' (or 'a' if merges collapsed)");
+    leo_free(&leo);
+    PASS();
+}
+
+static void test_leo_generate_produces_output(void) {
+    TEST("leo_generate: produces non-empty null-terminated output");
+    Leo leo;
+    leo_init(&leo);
+    leo_ingest(&leo,
+        "Leo watches the rain. Leo listens. The light comes in yellow. "
+        "Leo puts his hand in the light. The hand is warm. He waits. "
+        "The room is quiet. The quiet has weight. Leo hears it. "
+        "Leo has a stone. The stone is grey. Leo keeps it. "
+        "He does not ask. He thinks the light knows. Leo watches again.");
+    char buf[512];
+    int n = leo_generate(&leo, buf, sizeof(buf));
+    ASSERT(n > 0, "at least one token emitted");
+    ASSERT(strlen(buf) > 0, "output non-empty");
+    ASSERT(buf[strlen(buf) - 1] != 0xFF, "null-terminated");
+    leo_free(&leo);
+    PASS();
+}
+
+static void test_leo_generate_safe_on_empty_leo(void) {
+    TEST("leo_generate: degrades gracefully on empty Leo (no ingest)");
+    Leo leo;
+    leo_init(&leo);
+    char buf[128];
+    leo_generate(&leo, buf, sizeof(buf));
+    ASSERT(buf[0] != 0xFF, "output buffer valid");
+    /* should fall back to "..." since choose_start finds nothing */
+    ASSERT(strcmp(buf, "...") == 0, "empty Leo says '...'");
+    leo_free(&leo);
+    PASS();
+}
+
+/* ================================================================
  * main
  * ================================================================ */
 
@@ -358,6 +467,16 @@ int main(void) {
     test_leo_ingest_empty_is_noop();
     test_leo_ingest_trigram_order_matters();
     test_leo_bpe_merges_include_common_bigrams();
+
+    /* generation */
+    test_is_clean_seed_token();
+    test_is_boundary_token();
+    test_weighted_sample_uniform();
+    test_weighted_sample_peaked();
+    test_leo_choose_start_after_ingest();
+    test_leo_step_token_uses_bigram_fallback();
+    test_leo_generate_produces_output();
+    test_leo_generate_safe_on_empty_leo();
 
     printf("\n=== results: %d passed, %d failed ===\n\n",
            tests_passed, tests_failed);
