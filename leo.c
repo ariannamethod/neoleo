@@ -75,6 +75,22 @@ static const char *LEO_EMBEDDED_BOOTSTRAP =
 #define LEO_PAIN_DECAY     0.985f
 #define LEO_DEBT_DECAY     0.998f
 
+/* Retention-head memory compression gate.
+ *
+ * Per-token random 32-dim fingerprint W_embed[id] (persistent across
+ * Leo's lifetime, shared with SPA). A rolling state vector retains a
+ * compressed summary of recent tokens via Griffin conservation:
+ *     S = γ·S + √(1-γ²) · W_embed[emitted]
+ * A candidate's bias is cosine-like: dot(S, W_embed[candidate]).
+ * Tokens that resonate with the recent summary get a bias pull.
+ *
+ * One scale for now; can extend to 4 scales later for true RetNet-
+ * style multi-timescale memory. */
+#define LEO_RET_DIM         32
+#define LEO_RET_GAMMA       0.92f   /* single-scale retention */
+#define LEO_RET_CONSERVE    0.39f   /* √(1 - γ²) */
+#define LEO_RET_BIAS_WEIGHT 0.15f
+
 /* Kuramoto-coupled emotional chambers — AML / paper Appendix B.
  * Six chambers live inside LeoField as a body-perception submodule. */
 #define LEO_N_CHAMBERS  6
@@ -654,6 +670,17 @@ typedef struct {
      * act  = current activation,  ext = external input from prompt. */
     float chamber_act[LEO_N_CHAMBERS];
     float chamber_ext[LEO_N_CHAMBERS];
+
+    /* persistent per-token fingerprints (random init, not learned).
+     * Shared between the retention gate below and SPA's sentence
+     * embedding. One vector per token in the BPE vocab. */
+    float *w_embed;            /* [w_embed_cap * LEO_RET_DIM] */
+    int    w_embed_cap;
+
+    /* retention state — Griffin conservation, updated per emitted token
+     * inside leo_field_step. Encodes a compressed summary of recent
+     * tokens; candidates that resonate with it get a bias pull. */
+    float retention_state[LEO_RET_DIM];
 } LeoField;
 
 /* chamber decay rates (paper Appendix B.3): FEAR/LOVE/RAGE/VOID/FLOW/COMPLEX */
@@ -739,12 +766,37 @@ static void leo_field_init(LeoField *f, int vocab_cap) {
     f->destiny_bag = calloc(f->destiny_cap, sizeof(float));
     f->velocity_mode = LEO_VEL_WALK;
     f->velocity_mag = 0.5f;
+
+    /* persistent random W_embed: small [-0.025, +0.025] values. Same
+     * token → same vector for Leo's entire life. Used by retention
+     * gate and by SPA sentence embedding. */
+    f->w_embed_cap = f->destiny_cap;
+    f->w_embed = calloc((size_t)f->w_embed_cap * LEO_RET_DIM, sizeof(float));
+    for (int i = 0; i < f->w_embed_cap; i++) {
+        for (int d = 0; d < LEO_RET_DIM; d++) {
+            float r = (float)rand() / (float)RAND_MAX - 0.5f;
+            f->w_embed[i * LEO_RET_DIM + d] = 0.05f * r;
+        }
+    }
+    /* retention state starts at zero — Leo remembers nothing yet */
 }
 
 static void leo_field_free(LeoField *f) {
     free(f->destiny_bag); f->destiny_bag = NULL;
     free(f->bootstrap_ids); f->bootstrap_ids = NULL;
+    free(f->w_embed); f->w_embed = NULL;
     memset(f, 0, sizeof(*f));
+}
+
+/* dot(retention_state, W_embed[candidate]) — cosine-like bias */
+static float leo_field_retention_bias(const LeoField *f, int candidate) {
+    if (!f || !f->w_embed) return 0.0f;
+    if (candidate < 0 || candidate >= f->w_embed_cap) return 0.0f;
+    const float *v = f->w_embed + (size_t)candidate * LEO_RET_DIM;
+    float dot = 0.0f;
+    for (int d = 0; d < LEO_RET_DIM; d++)
+        dot += f->retention_state[d] * v[d];
+    return LEO_RET_BIAS_WEIGHT * dot;
 }
 
 /* Set the origin anchor. Caller provides ids; we copy. */
@@ -862,6 +914,16 @@ static void leo_field_step(LeoField *f, int emitted,
     /* chambers oscillate once per token */
     leo_field_chambers_crossfire(f, LEO_CHAMBER_ITERS_PER_STEP);
 
+    /* retention: Griffin conservation S = γ·S + √(1-γ²)·W_embed[emitted].
+     * A compressed summary of recent tokens lives here. */
+    if (f->w_embed && emitted >= 0 && emitted < f->w_embed_cap) {
+        const float *v = f->w_embed + (size_t)emitted * LEO_RET_DIM;
+        for (int d = 0; d < LEO_RET_DIM; d++) {
+            f->retention_state[d] = LEO_RET_GAMMA * f->retention_state[d]
+                                  + LEO_RET_CONSERVE * v[d];
+        }
+    }
+
     /* decay destiny bag; age prophecies */
     for (int i = 0; i < f->destiny_cap; i++)
         f->destiny_bag[i] *= 1.0f - LEO_DESTINY_ALPHA;
@@ -921,10 +983,14 @@ static float leo_field_candidate_bias(const LeoField *f, int candidate) {
     }
     /* chambers scale the channels (paper Appendix B.4).
      * destiny ← γ (VOID + COMPLEX), prophecy ← β (FLOW − FEAR).
-     * trauma rides raw — trauma has its own voice. */
+     * trauma rides raw — trauma has its own voice.
+     * retention rides raw too — it is a memory-compression signal,
+     * not a feeling. */
+    float retention = leo_field_retention_bias(f, candidate);
     return destiny  * leo_field_gamma_mod(f)
          + prophecy * leo_field_beta_mod(f)
-         + trauma;
+         + trauma
+         + retention;
 }
 
 /* Temperature multiplier from velocity + pain. Cold under trauma,

@@ -102,6 +102,32 @@ Runs the test suite (33 tests at the moment, all green).
 - +5 tests (42 total).
 - commit `fcd7a79`.
 
+### step 13 — memory compression gate (retention) inside LeoField
+
+Transformer trick used as an organ, not as the stack. Per-token random
+32-dim fingerprints live inside LeoField; a rolling state vector
+compresses recent history via Griffin conservation. Candidates that
+resonate with the compressed state receive a bias pull.
+
+- `LeoField.w_embed[vocab × 32]` — persistent random fingerprints.
+  Same token always maps to the same vector (hashed, not learned).
+  Shared with SPA's sentence embedding (same idea, same dim).
+- `LeoField.retention_state[32]` — Griffin conservation, updated per
+  emitted token inside `leo_field_step`:
+      S = γ · S  +  √(1 − γ²) · W_embed[emitted]
+  with γ = 0.92 (one scale for now; can extend to 4 RetNet-style
+  timescales later).
+- `leo_field_retention_bias(leo, candidate)`:
+      dot(S, W_embed[candidate]) × 0.15
+  added raw (no chamber modulation) in `leo_field_candidate_bias`.
+  Memory is a signal, not a feeling.
+- Verbatim effect (corpus-ingested Leo, prompt "What do you remember"):
+  > *He thinks tables are livelier. Gree. The pines. He lets the quiet
+  > be. The ang. He told nobody.*
+- +3 tests (64 total). Zero on fresh field, self-similarity after one
+  step, decay after 20 unrelated steps.
+- commit [pending].
+
 ### step 12 — chambers (Kuramoto 6) as body perception inside LeoField
 
 Six Kuramoto-coupled chambers live inside LeoField as a body submodule.

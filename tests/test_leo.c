@@ -910,6 +910,49 @@ static void test_leo_field_feel_text_love(void) {
     PASS();
 }
 
+static void test_leo_field_retention_zero_on_fresh(void) {
+    TEST("retention: bias ≈ 0 on fresh field (state is zero)");
+    LeoField f;
+    leo_field_init(&f, 256);
+    float b = leo_field_retention_bias(&f, 7);
+    ASSERT(fabsf(b) < 1e-4f, "fresh field gives no retention pull");
+    leo_field_free(&f);
+    PASS();
+}
+
+static void test_leo_field_retention_self_similarity(void) {
+    TEST("retention: emitted token's own fingerprint sees positive bias next step");
+    LeoField f;
+    leo_field_init(&f, 256);
+    leo_field_step(&f, 42, 1.0f);
+    /* Now retention_state ≈ conserve·W_embed[42]. Candidate 42 should
+     * have positive self-dot. (Random vectors rarely align with others,
+     * so 42's own fingerprint is the strongest match.) */
+    float b42 = leo_field_retention_bias(&f, 42);
+    /* Average bias for 20 random candidates */
+    float avg = 0;
+    for (int i = 100; i < 120; i++) avg += fabsf(leo_field_retention_bias(&f, i));
+    avg /= 20;
+    ASSERT(b42 > avg, "self-similarity exceeds avg random bias");
+    leo_field_free(&f);
+    PASS();
+}
+
+static void test_leo_field_retention_gamma_decay(void) {
+    TEST("retention: state decays over steps without same token");
+    LeoField f;
+    leo_field_init(&f, 256);
+    leo_field_step(&f, 42, 1.0f);
+    float b_before = leo_field_retention_bias(&f, 42);
+    /* 20 steps of OTHER tokens — retention should wash 42 out */
+    for (int t = 0; t < 20; t++) leo_field_step(&f, 100 + t, 1.0f);
+    float b_after = leo_field_retention_bias(&f, 42);
+    ASSERT(fabsf(b_after) < fabsf(b_before),
+           "42's retention trace faded");
+    leo_field_free(&f);
+    PASS();
+}
+
 static void test_leo_field_temp_mult_velocity_modes(void) {
     TEST("leo_field_temperature_mult: modes shift base");
     LeoField f;
@@ -1032,6 +1075,9 @@ int main(void) {
     test_leo_field_chambers_clamped();
     test_leo_field_chamber_mods_identity_at_zero();
     test_leo_field_feel_text_love();
+    test_leo_field_retention_zero_on_fresh();
+    test_leo_field_retention_self_similarity();
+    test_leo_field_retention_gamma_decay();
     test_leo_field_temp_mult_velocity_modes();
     test_leo_respond_gravity_restored_after_call();
 
