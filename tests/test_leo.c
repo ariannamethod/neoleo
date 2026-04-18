@@ -771,6 +771,56 @@ static void test_spa_cross_attend_outlier_scores_lower(void) {
     PASS();
 }
 
+/* ================================================================
+ * PROMPT + GRAVITY
+ * ================================================================ */
+
+static void test_compute_prompt_gravity_nonempty(void) {
+    TEST("compute_prompt_gravity: produces non-zero weights for ingested tokens");
+    Leo leo;
+    leo_init(&leo);
+    leo_ingest(&leo,
+        "Leo watches the rain. Leo listens. Leo waits. Leo has a stone. "
+        "The rain is soft. The room is quiet. The light is yellow.");
+    int ids[32];
+    int n = bpe_encode(&leo.bpe, (const uint8_t *)"rain quiet", 10, ids, 32);
+    float *g = compute_prompt_gravity(&leo, ids, n);
+    float sum = 0;
+    for (int i = 0; i < leo.bpe.vocab_size; i++) sum += g[i];
+    ASSERT(sum > 0.0f, "gravity has at least some mass");
+    free(g);
+    leo_free(&leo);
+    PASS();
+}
+
+static void test_leo_respond_empty_prompt_falls_back(void) {
+    TEST("leo_respond: empty prompt → plain chain (no crash)");
+    Leo leo;
+    leo_init(&leo);
+    leo_ingest(&leo,
+        "Leo watches the rain. Leo listens. Leo waits. He has a stone. "
+        "The room is quiet. The light is yellow. He waits.");
+    char buf[512];
+    int produced = leo_respond(&leo, "", buf, sizeof(buf));
+    ASSERT(produced > 0, "at least some tokens produced");
+    leo_free(&leo);
+    PASS();
+}
+
+static void test_leo_respond_gravity_restored_after_call(void) {
+    TEST("leo_respond: leo->gravity is cleared when the call returns");
+    Leo leo;
+    leo_init(&leo);
+    leo_ingest(&leo,
+        "Leo watches the rain. Leo listens. The light is yellow. "
+        "The rain falls. The room is quiet. Leo waits.");
+    char buf[512];
+    leo_respond(&leo, "what do you hear", buf, sizeof(buf));
+    ASSERT(leo.gravity == NULL, "transient gravity cleared");
+    leo_free(&leo);
+    PASS();
+}
+
 static void test_leo_generate_safe_on_empty_leo(void) {
     TEST("leo_generate: degrades gracefully on empty Leo (no ingest)");
     Leo leo;
@@ -847,6 +897,9 @@ int main(void) {
     test_coherence_score_positive_on_seen_phrase();
     test_leo_generate_best_picks_coherent();
     test_leo_generate_ex_honors_start_hint();
+    test_compute_prompt_gravity_nonempty();
+    test_leo_respond_empty_prompt_falls_back();
+    test_leo_respond_gravity_restored_after_call();
 
     /* SPA */
     test_spa_init_random();

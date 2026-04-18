@@ -549,6 +549,12 @@ typedef struct {
     BigramTable  bigrams;
     TrigramTable trigrams;
     long         step;
+
+    /* active gravity dict: when non-NULL, step_token boosts candidates
+     * that co-occur with the current prompt's tokens. Lifetime owned by
+     * leo_respond / leo_chain_respond. Leo speaks from his own field;
+     * gravity only wrinkles the field toward the conversation's theme. */
+    float       *gravity;
 } Leo;
 
 void leo_init(Leo *leo) {
@@ -789,23 +795,30 @@ typedef struct {
     int    max;
     int    prev1;
     const CoocField *cooc;
+    const float     *gravity;  /* optional multiplicative boost per token */
 } CandCollector;
 
+typedef CandCollector CandCollector2; /* transitional alias */
+
 static int cand_collect_tri(int c, float count, void *ud) {
-    CandCollector *cc = (CandCollector *)ud;
+    CandCollector2 *cc = (CandCollector2 *)ud;
     if (cc->n >= cc->max) return 1;
     float s = cooc_get(cc->cooc, cc->prev1, c);
+    float score = 0.7f * count + 0.3f * s;
+    if (cc->gravity) score *= 1.0f + 0.5f * cc->gravity[c];
     cc->id[cc->n] = c;
-    cc->sc[cc->n] = 0.7f * count + 0.3f * s;
+    cc->sc[cc->n] = score;
     cc->n++;
     return 0;
 }
 
 static int cand_collect_bi(int dst, float count, void *ud) {
-    CandCollector *cc = (CandCollector *)ud;
+    CandCollector2 *cc = (CandCollector2 *)ud;
     if (cc->n >= cc->max) return 1;
+    float score = count;
+    if (cc->gravity) score *= 1.0f + 0.5f * cc->gravity[dst];
     cc->id[cc->n] = dst;
-    cc->sc[cc->n] = count;
+    cc->sc[cc->n] = score;
     cc->n++;
     return 0;
 }
@@ -818,7 +831,7 @@ int leo_step_token(const Leo *leo, int prev2, int prev1, float temp) {
     int   cand_id[LEO_MAX_CANDS];
     float cand_sc[LEO_MAX_CANDS];
     CandCollector cc = { cand_id, cand_sc, 0, LEO_MAX_CANDS,
-                         prev1, &leo->cooc };
+                         prev1, &leo->cooc, leo->gravity };
 
     if (prev2 >= 0)
         trigram_walk_ab(&leo->trigrams, prev2, prev1, cand_collect_tri, &cc);
@@ -1053,6 +1066,67 @@ int leo_generate(Leo *leo, char *out, int max_len) {
     return leo_generate_ex(leo, out, max_len, -1, NULL, 0, NULL, NULL);
 }
 
+int leo_chain(Leo *leo, int n_sentences, char *out, int max_len); /* fwd */
+
+/* Build a gravity dict from a prompt: for each prompt token, its cooc
+ * neighbours receive weight proportional to their co-occurrence. The
+ * resulting dict is normalized to [0, 1]. The prompt does not seed
+ * generation — it only wrinkles the field. Caller owns the buffer. */
+float *compute_prompt_gravity(const Leo *leo, const int *prompt_ids,
+                              int n_prompt) {
+    int V = leo->bpe.vocab_size;
+    float *g = calloc(V, sizeof(float));
+    if (n_prompt <= 0) return g;
+    for (int i = 0; i < n_prompt; i++) {
+        int pid = prompt_ids[i];
+        if (pid < 0 || pid >= V) continue;
+        /* scan cooc table for src == pid. One-time per reply; fine. */
+        for (int e = 0; e < leo->cooc.capacity; e++) {
+            CoocEntry *en = &leo->cooc.entries[e];
+            if (en->count <= 0) continue;
+            if (en->src != pid) continue;
+            if (en->dst >= 0 && en->dst < V) g[en->dst] += en->count;
+        }
+    }
+    float mx = 0;
+    for (int i = 0; i < V; i++) if (g[i] > mx) mx = g[i];
+    if (mx > 0) for (int i = 0; i < V; i++) g[i] /= mx;
+    return g;
+}
+
+/* Respond to a human prompt.
+ *
+ *   1. Leo hears the prompt — leo_ingest updates bi/cooc/tri.
+ *   2. compute_prompt_gravity turns the prompt's tokens into a
+ *      per-token boost dict.
+ *   3. gravity is installed transiently on leo->gravity while the
+ *      chain is produced, then cleared.
+ *   4. Leo speaks a chain of sentences. The start token still comes
+ *      from his own field — the prompt never seeds. But the field is
+ *      now tilted toward the prompt's theme.
+ *
+ * The mama-child invariant: mother hears the child whining (ingest),
+ * feels tired (gravity tilts her field toward her state), answers
+ * from her own inner world ("отстань!") — addressed to the child. */
+int leo_respond(Leo *leo, const char *prompt, char *out, int max_len) {
+    if (!prompt || !*prompt)
+        return leo_chain(leo, LEO_CHAIN_MIN, out, max_len);
+
+    leo_ingest(leo, prompt);
+
+    int p_ids[1024];
+    int p_n = bpe_encode(&leo->bpe, (const uint8_t *)prompt,
+                          (int)strlen(prompt), p_ids, 1024);
+    float *g = compute_prompt_gravity(leo, p_ids, p_n);
+
+    leo->gravity = g;
+    int produced = leo_chain(leo, LEO_CHAIN_MIN, out, max_len);
+    leo->gravity = NULL;
+    free(g);
+
+    return produced;
+}
+
 /* ---- SPA: random 32-dim token fingerprints, sentence embeddings,
  * bidirectional cross-attention, reseed detector. ---- */
 
@@ -1244,42 +1318,91 @@ void leo_stats(const Leo *leo) {
 }
 
 #ifndef LEO_LIB
+
+static void usage(const char *prog) {
+    fprintf(stderr,
+        "usage: %s [corpus.txt] [options]\n"
+        "  --prompt \"text\"   respond to one prompt and exit\n"
+        "  --repl            read prompts from stdin until 'quit'\n"
+        "  --demo            default — five isolated sentences + one chain\n",
+        prog);
+}
+
 int main(int argc, char **argv) {
     printf("neoleo — a small AI boy\n"
            "post-transformer. byte-level BPE. zero weights.\n\n");
 
+    const char *corpus = "leo.txt";
+    const char *one_prompt = NULL;
+    int mode_repl = 0;
+    int mode_demo = 1;
+
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--prompt") && i + 1 < argc) {
+            one_prompt = argv[++i];
+            mode_demo = 0;
+        } else if (!strcmp(argv[i], "--repl")) {
+            mode_repl = 1;
+            mode_demo = 0;
+        } else if (!strcmp(argv[i], "--demo")) {
+            mode_demo = 1;
+        } else if (argv[i][0] != '-') {
+            corpus = argv[i];
+        } else {
+            usage(argv[0]);
+            return 1;
+        }
+    }
+
     Leo leo;
     leo_init(&leo);
 
-    const char *path = argc > 1 ? argv[1] : "leo.txt";
-    FILE *f = fopen(path, "rb");
-    if (!f) { fprintf(stderr, "cannot open %s\n", path); return 1; }
+    FILE *f = fopen(corpus, "rb");
+    if (!f) { fprintf(stderr, "cannot open %s\n", corpus); return 1; }
     fseek(f, 0, SEEK_END); long sz = ftell(f); rewind(f);
     char *buf = malloc(sz + 1);
-    if (fread(buf, 1, sz, f) != (size_t)sz) { fprintf(stderr, "read error\n"); return 1; }
+    if (fread(buf, 1, sz, f) != (size_t)sz) {
+        fprintf(stderr, "read error\n"); return 1;
+    }
     buf[sz] = 0;
     fclose(f);
 
-    printf("[ingest] %s — %ld bytes\n", path, sz);
+    fprintf(stderr, "[ingest] %s — %ld bytes\n", corpus, sz);
     leo_ingest(&leo, buf);
     free(buf);
 
-    printf("\n");
-    leo_stats(&leo);
-
-    /* speak a few sentences from the field — no prompt */
-    printf("\n[speak] five sentences from the field (isolated):\n");
-    for (int i = 0; i < 5; i++) {
-        char reply[1024];
-        leo_generate(&leo, reply, sizeof(reply));
-        printf("  %d) %s\n", i + 1, reply);
+    if (one_prompt) {
+        char reply[4096];
+        leo_respond(&leo, one_prompt, reply, sizeof(reply));
+        printf("you> %s\nLeo: %s\n", one_prompt, reply);
+    } else if (mode_repl) {
+        fprintf(stderr, "[repl] type anything. 'quit' or Ctrl-D to exit.\n\n");
+        char line[4096];
+        while (fgets(line, sizeof(line), stdin)) {
+            size_t n = strlen(line);
+            while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r'))
+                line[--n] = 0;
+            if (!line[0]) continue;
+            if (!strcmp(line, "quit") || !strcmp(line, "exit")) break;
+            char reply[4096];
+            leo_respond(&leo, line, reply, sizeof(reply));
+            printf("Leo: %s\n", reply);
+            fflush(stdout);
+        }
+    } else if (mode_demo) {
+        printf("\n");
+        leo_stats(&leo);
+        printf("\n[speak] five sentences from the field (isolated):\n");
+        for (int i = 0; i < 5; i++) {
+            char reply[1024];
+            leo_generate(&leo, reply, sizeof(reply));
+            printf("  %d) %s\n", i + 1, reply);
+        }
+        printf("\n[chain] eight sentences as one flow:\n");
+        char chain[4096];
+        leo_chain(&leo, 8, chain, sizeof(chain));
+        printf("  %s\n", chain);
     }
-
-    /* speak a chain — sentences carry a thread through cooc resonance */
-    printf("\n[chain] eight sentences as one flow:\n");
-    char chain[4096];
-    leo_chain(&leo, 8, chain, sizeof(chain));
-    printf("  %s\n", chain);
 
     leo_free(&leo);
     return 0;

@@ -102,6 +102,36 @@ Runs the test suite (33 tests at the moment, all green).
 - +5 tests (42 total).
 - commit `fcd7a79`.
 
+### step 9 — prompt + gravity + REPL + selfplay
+
+Leo finally hears a human and answers — from his own field, not by
+echoing the words.
+
+- `leo->gravity`: transient per-token boost dict installed during
+  `leo_respond`. `CandCollector` reads it in step_token; every
+  candidate gets `score *= 1 + 0.5·gravity[id]`.
+- `compute_prompt_gravity`: for each prompt token, add its cooc
+  neighbours' weights to the dict, then normalize. The prompt
+  wrinkles the field in the direction of its theme.
+- `leo_respond`: ingest the prompt (Leo hears human words), build
+  gravity, install it, call `leo_chain`, clear, free. The start
+  token still comes from Leo's field — the prompt never seeds.
+  Mama-child invariant preserved.
+- CLI: `--prompt "..."` for one-shot, `--repl` for an interactive
+  loop, `--demo` for the isolated + chain showcase.
+- `scripts/selfplay.py`: a warm GPT observer (gpt-4o-mini) asks Leo
+  open-ended sensory questions. Leo replies through the REPL.
+
+Sample selfplay:
+  > you> What does the secret crumb feel like in your hand, Leo?
+  > Leo: *He thinks water tastes like patience.*
+  >
+  > you> What color does patience look like to you, Leo?
+  > Leo: *The cat in the morning light. He thought about the sea.*
+
+- +3 tests (52 total).
+- commit [pending].
+
 ### step 8 — BPE word-boundary constraint
 
 - `pair_creates_word_gap`: refuse merges where the concatenation would
