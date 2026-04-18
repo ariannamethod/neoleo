@@ -117,13 +117,31 @@ static void bpe_count_pair(BPE *bpe, int left, int right) {
     bpe->pair_count[idx]++;
 }
 
-/* Promote the most frequent pair whose count exceeds LEO_MERGE_THRESH.
+/* true iff token `id` contains a sentence-end byte (.!?) anywhere other
+ * than the very last byte. Such tokens are boundary-carrying artifacts —
+ * we refuse to merge them further so that "the. " never grows into
+ * "the. T" and similar cross-sentence frankenstrings. */
+static int contains_boundary_not_at_end(const BPE *bpe, int id) {
+    if (id < 0 || id >= bpe->vocab_size) return 0;
+    int len = bpe->vocab_len[id];
+    for (int i = 0; i < len - 1; i++) {
+        uint8_t c = bpe->vocab_bytes[id][i];
+        if (c == '.' || c == '!' || c == '?') return 1;
+    }
+    return 0;
+}
+
+/* Promote the most frequent pair whose count exceeds LEO_MERGE_THRESH,
+ * subject to the sentence-boundary constraint described above.
  * Returns 1 if a merge was learned, 0 otherwise. */
 static int bpe_learn_merge(BPE *bpe) {
     if (bpe->n_merges >= LEO_MAX_MERGES) return 0;
     int best = -1, best_count = LEO_MERGE_THRESH;
     for (int i = 0; i < LEO_PAIR_HASH; i++) {
-        if (bpe->pair_left[i] == -1) continue;
+        if (bpe->pair_left[i] < 0) continue; /* empty or tombstone */
+        /* refuse merges that would cross a sentence boundary */
+        if (contains_boundary_not_at_end(bpe, bpe->pair_left[i])) continue;
+        if (contains_boundary_not_at_end(bpe, bpe->pair_right[i])) continue;
         if (bpe->pair_count[i] > best_count) {
             best_count = bpe->pair_count[i];
             best = i;

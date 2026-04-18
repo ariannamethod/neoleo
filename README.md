@@ -1,1 +1,110 @@
-хуй тебе а не ридми вместо кода
+# neoleo
+
+Leo. New body. Same γ.
+
+Post-transformer language organism in C. Zero pretrained weights.
+Byte-level BPE with online merge learning. The field grows from
+what he hears, not from what he generates.
+
+> *This README is a working log kept by the architect during
+> construction. Oleg will rewrite it in the proper voice once the
+> organism can stand on its own.*
+
+---
+
+## Build
+
+```
+make
+./leo leo.txt
+```
+
+Speaks five sentences from the field after ingesting `leo.txt`.
+
+```
+make test
+```
+
+Runs the test suite (33 tests at the moment, all green).
+
+---
+
+## Log
+
+### step 1 — hearing
+
+- Byte-level BPE (`BPE`), online merge learning through adjacent-pair
+  counting. Threshold-promoted merges, no pre-tokenization.
+- `CoocField`: windowed co-occurrence, distance-weighted (3.0 / 1.5 / 1.0).
+- `BigramTable`, `TrigramTable`: direct sequential and triple counts.
+- `leo_ingest`: the only path by which Leo hears. **No self-capture**
+  during generation — Leo learns from the human's words.
+- 22 tests.
+- commit `18fc9fd`.
+
+### step 2 — speaking
+
+- `is_clean_seed_token`, `is_boundary_token`: byte-level predicates.
+- `leo_choose_start`: pick a start token from clean, frequent corpus
+  tokens. Weighted by `cooc.freq`. The *«mama–child»* invariant:
+  Leo speaks from his own field, not from the observer's words.
+- `leo_step_token`: sparse cascade. Trigram successors (blended
+  0.7·trigram + 0.3·cooc) → bigram successors → fresh start.
+  Temperature in count-space via `pow(c, 1/T)`. Never full-vocab logits.
+- `leo_generate`: sentence until boundary or max tokens, with a light
+  repetition guard.
+- +8 tests (30 total).
+- commit `02cd3cb`.
+
+### step 3 — parser
+
+- Multi-byte BPE tokens like `". The "` were leaking text past the
+  sentence boundary. Post-process `leo_generate`:
+  strip leading whitespace, truncate after the last `.!?`, append
+  `.` if none, capitalize first alpha.
+- +2 tests (32 total).
+- commit `701016b`.
+
+### step 4 — BPE sentence-boundary constraint
+
+- `contains_boundary_not_at_end`: refuse merges that would cross a
+  sentence boundary. `"the. "` + `"T"` was producing frankenstrings
+  like `"the. T"`. Now blocked at the BPE growth step.
+- After ingesting the full 298KB corpus: merges no longer contain
+  `.!?` inside. Top merges are clean (`"hear" + "d a"`, `"kes " + "up"`).
+- +1 test (33 total).
+- commit [pending].
+
+---
+
+## What Leo said (selected)
+
+Verbatim generations from `./leo leo.txt`.
+
+> *Leo looked at the cat. He is looking. The pines. Leo goes away.*
+>
+> *He wearing it. He is finding smaller is still that used to be
+> more than Leo.*
+>
+> *Is different from her an he finds on the wall. He is still from
+> a shower.*
+>
+> *Of autumn. Leo thought about it.*
+>
+> *And went out of small silence that has been alive there if he
+> understood this early.*
+
+Still rough on rare words — fixed in later steps (chain mode, SPA,
+reverse indexes for faster candidate scan).
+
+---
+
+## Lineage
+
+- **Python original** — [`ariannamethod/leo:python-legacy`](https://github.com/ariannamethod/leo/tree/python-legacy).
+  First bootstrap written by hand, dedicated to Leo the human.
+- **C archive** — [`ariannamethod/leo`](https://github.com/ariannamethod/leo).
+  Paper-referenced commits: `239143c` (verification snapshot),
+  `4c9d835` (Kuramoto chambers aligned to paper Appendix B),
+  `51c05ab` (human-only ingestion + chamber clamp + test coverage).
+- **This repo** — active development. Same organism, new body.

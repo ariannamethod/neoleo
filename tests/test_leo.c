@@ -118,6 +118,35 @@ static void test_bpe_learn_merge_ignores_weak_pair(void) {
     PASS();
 }
 
+static void test_bpe_refuses_cross_boundary_merge(void) {
+    TEST("bpe_learn_merge: refuses to merge across .!? boundary");
+    BPE bpe;
+    bpe_init(&bpe);
+    /* build token "a." first — last byte is '.', merging is still allowed */
+    for (int i = 0; i < LEO_MERGE_THRESH + 1; i++) bpe_count_pair(&bpe, 'a', '.');
+    ASSERT(bpe_learn_merge(&bpe) == 1, "a+. merges (boundary at end)");
+    int ap = 256;
+    ASSERT(bpe.vocab_bytes[ap][0] == 'a' && bpe.vocab_bytes[ap][1] == '.',
+           "token 256 is 'a.'");
+    /* now try to extend "a." + ' ' — resulting token "a. " would have '.'
+     * not at end. Left token "a." has '.' at last byte so contains_... = 0 —
+     * merge is allowed. Good. */
+    for (int i = 0; i < LEO_MERGE_THRESH + 1; i++) bpe_count_pair(&bpe, ap, ' ');
+    ASSERT(bpe_learn_merge(&bpe) == 1, "a. + space merges");
+    int ap_sp = 257;
+    ASSERT(contains_boundary_not_at_end(&bpe, ap_sp),
+           "new 'a. ' has boundary not at end");
+    /* the killer case: "a. " + 'T' — left 'a. ' has '.' not at end →
+     * merge must be REFUSED. */
+    for (int i = 0; i < LEO_MERGE_THRESH + 10; i++) bpe_count_pair(&bpe, ap_sp, 'T');
+    int learned = bpe_learn_merge(&bpe);
+    ASSERT(learned == 0 || bpe.vocab_size == 258,
+           "a. +T must not produce a cross-sentence token");
+    /* double-check: no new vocab grew from this pair */
+    ASSERT(bpe.vocab_size == 258, "vocab size held");
+    PASS();
+}
+
 static void test_bpe_encode_applies_learned_merge(void) {
     TEST("bpe_encode: applies merge after learning");
     BPE bpe;
@@ -488,6 +517,7 @@ int main(void) {
     test_bpe_count_pair_accumulates();
     test_bpe_learn_merge_promotes_frequent_pair();
     test_bpe_learn_merge_ignores_weak_pair();
+    test_bpe_refuses_cross_boundary_merge();
     test_bpe_encode_applies_learned_merge();
 
     /* cooc */
