@@ -81,21 +81,36 @@ def start_leo_repl() -> subprocess.Popen:
 
 
 LEO_PREFIX = re.compile(r"^Leo:\s*(.*)$")
+TURN_PREFIX = re.compile(r"^\[turn\]\s+(.*)$")
+STATS_PREFIX = re.compile(r"^\[stats\]\s+(.*)$")
 
 
-def read_leo_reply(proc: subprocess.Popen, timeout: float = 60.0) -> str:
-    """Read one 'Leo: ...' line from the REPL."""
+def read_until(proc: subprocess.Popen, pattern: re.Pattern,
+               timeout: float = 60.0) -> str:
     t0 = time.time()
     while True:
         if time.time() - t0 > timeout:
-            return "[leo timeout]"
+            return "[timeout]"
         line = proc.stdout.readline()
         if not line:
-            return "[leo closed]"
+            return "[closed]"
         line = line.rstrip()
-        m = LEO_PREFIX.match(line)
+        m = pattern.match(line)
         if m:
             return m.group(1).strip()
+
+
+def read_leo_reply(proc: subprocess.Popen, timeout: float = 60.0) -> str:
+    reply = read_until(proc, LEO_PREFIX, timeout)
+    # drain the [turn] counters line too, ignore if absent
+    drain = read_until(proc, TURN_PREFIX, timeout=3.0)
+    return reply, drain
+
+
+def query_stats(proc: subprocess.Popen) -> str:
+    proc.stdin.write("/stats\n")
+    proc.stdin.flush()
+    return read_until(proc, STATS_PREFIX, timeout=10.0)
 
 
 def main() -> None:
@@ -125,8 +140,14 @@ def main() -> None:
             # feed to Leo
             leo.stdin.write(observer_line + "\n")
             leo.stdin.flush()
-            reply = read_leo_reply(leo)
+            reply, turn_delta = read_leo_reply(leo)
             print(f"           Leo: {reply}")
+            if turn_delta and turn_delta != "[timeout]":
+                print(f"           [{turn_delta}]")
+
+            stats = query_stats(leo)
+            if stats and stats != "[timeout]":
+                print(f"           [{stats}]")
 
             # keep history as a short rolling context
             history.append({"role": "assistant", "content": observer_line})

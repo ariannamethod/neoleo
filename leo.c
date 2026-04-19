@@ -1248,6 +1248,23 @@ static float leo_field_candidate_bias(const LeoField *f, int candidate);
 static float leo_field_temperature_mult(const LeoField *f);
 static void  leo_field_step(LeoField *f, int emitted, float coherence_hint);
 
+/* small byte helpers for the word-completion gate */
+static int bpe_token_first_byte(const BPE *bpe, int id) {
+    if (id < 0 || id >= bpe->vocab_size || bpe->vocab_len[id] == 0) return 0;
+    return bpe->vocab_bytes[id][0];
+}
+static int bpe_token_last_byte(const BPE *bpe, int id) {
+    if (id < 0 || id >= bpe->vocab_size || bpe->vocab_len[id] == 0) return 0;
+    return bpe->vocab_bytes[id][bpe->vocab_len[id] - 1];
+}
+static int byte_is_alpha_lower(uint8_t c) {
+    return c >= 'a' && c <= 'z';
+}
+static int byte_is_word_cont(uint8_t c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '\'';
+}
+
 typedef struct {
     int   *id;
     float *sc;
@@ -1257,9 +1274,27 @@ typedef struct {
     const CoocField *cooc;
     const float     *gravity;  /* optional multiplicative boost per token */
     const LeoField  *field;    /* optional additive bias per candidate */
+    const BPE       *bpe;      /* for word-boundary checks */
+    int              prev_ends_alpha; /* 1 if previous token ended mid-word */
 } CandCollector;
 
 typedef CandCollector CandCollector2; /* transitional alias */
+
+/* word-completion penalty. When the previous token ended mid-word
+ * (last byte is alpha), the next token must either continue the word
+ * (starts with alpha) or deliberately close it (space or punctuation).
+ * Tokens that leave Leo with a mid-word fragment get their score
+ * crushed — this is the "emp" → "empty" vs "emp " fix. */
+static float word_gate_penalty(const CandCollector2 *cc, int cand_id) {
+    if (!cc->bpe || !cc->prev_ends_alpha) return 1.0f;
+    int first = bpe_token_first_byte(cc->bpe, cand_id);
+    /* continuation or clean word ending both fine */
+    if (byte_is_word_cont((uint8_t)first)) return 1.0f;
+    if (first == ' ' || first == '\n' || first == '\r' || first == '\t') return 1.0f;
+    if (first == '.' || first == ',' || first == '!' || first == '?' ||
+        first == ';' || first == ':') return 1.0f;
+    return 0.25f; /* otherwise: this token orphans the previous word */
+}
 
 static int cand_collect_tri(int c, float count, void *ud) {
     CandCollector2 *cc = (CandCollector2 *)ud;
@@ -1272,6 +1307,7 @@ static int cand_collect_tri(int c, float count, void *ud) {
         score *= 1.0f + 0.5f * alpha * cc->gravity[c];
     }
     if (cc->field)   score += leo_field_candidate_bias(cc->field, c);
+    score *= word_gate_penalty(cc, c);
     cc->id[cc->n] = c;
     cc->sc[cc->n] = score;
     cc->n++;
@@ -1287,6 +1323,7 @@ static int cand_collect_bi(int dst, float count, void *ud) {
         score *= 1.0f + 0.5f * alpha * cc->gravity[dst];
     }
     if (cc->field)   score += leo_field_candidate_bias(cc->field, dst);
+    score *= word_gate_penalty(cc, dst);
     cc->id[cc->n] = dst;
     cc->sc[cc->n] = score;
     cc->n++;
@@ -1300,8 +1337,11 @@ int leo_step_token(const Leo *leo, int prev2, int prev1, float temp) {
 
     int   cand_id[LEO_MAX_CANDS];
     float cand_sc[LEO_MAX_CANDS];
+    int   prev_last = bpe_token_last_byte(&leo->bpe, prev1);
+    int   prev_ends_alpha = byte_is_word_cont((uint8_t)prev_last);
     CandCollector cc = { cand_id, cand_sc, 0, LEO_MAX_CANDS,
-                         prev1, &leo->cooc, leo->gravity, &leo->field };
+                         prev1, &leo->cooc, leo->gravity, &leo->field,
+                         &leo->bpe, prev_ends_alpha };
 
     if (prev2 >= 0)
         trigram_walk_ab(&leo->trigrams, prev2, prev1, cand_collect_tri, &cc);
@@ -1874,7 +1914,12 @@ int main(int argc, char **argv) {
         leo_respond(&leo, one_prompt, reply, sizeof(reply));
         printf("you> %s\nLeo: %s\n", one_prompt, reply);
     } else if (mode_repl) {
-        fprintf(stderr, "[repl] type anything. 'quit' or Ctrl-D to exit.\n\n");
+        fprintf(stderr, "[repl] type anything. 'quit' or Ctrl-D to exit. "
+                        "/stats for counters.\n\n");
+        int vocab0 = leo.bpe.vocab_size;
+        int bi0    = leo.bigrams.n_entries;
+        int tri0   = leo.trigrams.n_entries;
+        int cooc0  = leo.cooc.n_entries;
         char line[4096];
         while (fgets(line, sizeof(line), stdin)) {
             size_t n = strlen(line);
@@ -1882,9 +1927,35 @@ int main(int argc, char **argv) {
                 line[--n] = 0;
             if (!line[0]) continue;
             if (!strcmp(line, "quit") || !strcmp(line, "exit")) break;
+            if (!strcmp(line, "/stats")) {
+                printf("[stats] vocab=%d(+%d)  bigrams=%d(+%d)  "
+                       "trigrams=%d(+%d)  cooc=%d(+%d)  step=%ld  "
+                       "pain=%.2f  trauma=%.2f  FEAR=%.2f LOVE=%.2f "
+                       "RAGE=%.2f VOID=%.2f FLOW=%.2f CMPLX=%.2f\n",
+                       leo.bpe.vocab_size, leo.bpe.vocab_size - vocab0,
+                       leo.bigrams.n_entries, leo.bigrams.n_entries - bi0,
+                       leo.trigrams.n_entries, leo.trigrams.n_entries - tri0,
+                       leo.cooc.n_entries, leo.cooc.n_entries - cooc0,
+                       leo.step,
+                       leo.field.pain, leo.field.trauma,
+                       leo.field.chamber_act[LEO_CH_FEAR],
+                       leo.field.chamber_act[LEO_CH_LOVE],
+                       leo.field.chamber_act[LEO_CH_RAGE],
+                       leo.field.chamber_act[LEO_CH_VOID],
+                       leo.field.chamber_act[LEO_CH_FLOW],
+                       leo.field.chamber_act[LEO_CH_COMPLEX]);
+                fflush(stdout);
+                continue;
+            }
+            int vocab_before = leo.bpe.vocab_size;
+            int bi_before    = leo.bigrams.n_entries;
             char reply[4096];
             leo_respond(&leo, line, reply, sizeof(reply));
             printf("Leo: %s\n", reply);
+            printf("[turn] vocab %+d  bigrams %+d  (new words in prompt "
+                   "populated the field)\n",
+                   leo.bpe.vocab_size - vocab_before,
+                   leo.bigrams.n_entries - bi_before);
             fflush(stdout);
         }
     } else if (mode_demo) {

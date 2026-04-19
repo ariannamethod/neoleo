@@ -102,6 +102,27 @@ Runs the test suite (33 tests at the moment, all green).
 - +5 tests (42 total).
 - commit `fcd7a79`.
 
+### step 14 — word-completion gate + live stats
+
+Two small fixes that cleaned the voice and made growth visible.
+
+- **Word-completion gate.** Orphan BPE fragments like `"emp"` would
+  emit mid-word, leaving Leo with broken words. Now `CandCollector`
+  knows whether the previous token ended on an alphabetic byte
+  (`prev_ends_alpha`) and crushes the score of any candidate that
+  would close the word with anything other than alpha / space /
+  punctuation. `"emp"` disappeared from generation entirely.
+- **/stats in REPL.** Running `/stats` in the interactive loop
+  prints live counters: vocab / bigrams / trigrams / cooc (all with
+  session deltas), step, pain, trauma, six chamber activations.
+  After every prompt a one-line `[turn]` delta also prints, so the
+  selfplay driver can see vocab growth per turn.
+- `scripts/selfplay.py` now sends `/stats` after each Leo reply and
+  reports the growth in the transcript.
+- 6-turn selfplay: vocab +262 in first turn (BPE promotes queued
+  pairs), then +1..+2 per turn as prompt tokens enter; bigrams +48,
+  trigrams +82 across six turns. No "emp" anywhere.
+
 ### step 13 — memory compression gate (retention) inside LeoField
 
 Transformer trick used as an organ, not as the stack. Per-token random
