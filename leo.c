@@ -845,6 +845,41 @@ static float leo_field_tau_mod(const LeoField *f) {
                 + 0.2f * f->chamber_act[LEO_CH_FLOW];
 }
 
+/* Self-voice feed: Leo hears his own emitted token. If the token
+ * contains an anchor (exact or substring), the corresponding chamber's
+ * external input gets a tiny nudge. Body perception — tело реагирует
+ * на то что Leo сам произнёс. Called from leo_generate_ex per emit.
+ *
+ * Cheap and safe: we do not ingest the token back into cooc/bigram/tri
+ * (that would break the "Leo hears only human" invariant). This is
+ * strictly chamber-level body feedback. */
+static void leo_field_self_voice(LeoField *f, const BPE *bpe, int token_id) {
+    if (!f || !bpe || token_id < 0) return;
+    char buf[LEO_MAX_TOKEN_LEN + 1];
+    int len = bpe_decode_token(bpe, token_id, buf, sizeof(buf));
+    if (len <= 0) return;
+    char cur[32];
+    int wi = 0;
+    for (int i = 0; i < len && wi < 31; i++) {
+        unsigned char c = (unsigned char)buf[i];
+        if (isalpha(c)) cur[wi++] = (char)tolower(c);
+    }
+    if (wi < 3) return;
+    cur[wi] = 0;
+    for (size_t i = 0; i < LEO_CH_N_ANCHORS; i++) {
+        const char *a = LEO_CH_ANCHORS[i].word;
+        size_t al = strlen(a);
+        int hit = !strcmp(cur, a) ||
+                  (al >= 3 && (strstr(cur, a) || strstr(a, cur)));
+        if (hit) {
+            f->chamber_ext[LEO_CH_ANCHORS[i].chamber] =
+                clampf(f->chamber_ext[LEO_CH_ANCHORS[i].chamber] + 0.01f,
+                       0.0f, 1.0f);
+            return;
+        }
+    }
+}
+
 /* Feed text into chamber external inputs — anchor words drive chambers.
  * Exact match first (full weight), then substring match (half weight).
  * Substring covers morphology: "emptied" and "emptying" both hit "empty"
@@ -1435,6 +1470,8 @@ int leo_generate_ex(Leo *leo, char *out, int max_len,
          * a simple proxy (did we find any trigram/bigram candidate?) —
          * when prev1 has no successors, pain grows toward bootstrap. */
         leo_field_step(&leo->field, nxt, nxt >= 0 ? 1.0f : 0.0f);
+        /* body hears its own voice — anchor tokens nudge chambers */
+        leo_field_self_voice(&leo->field, &leo->bpe, nxt);
 
         /* light repetition guard: kill immediate and back-to-back repeats */
         if (nxt == prev1) continue;

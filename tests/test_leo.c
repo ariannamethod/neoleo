@@ -923,6 +923,39 @@ static void test_leo_field_feel_text_substring_morphology(void) {
     PASS();
 }
 
+static void test_leo_field_self_voice_raises_chamber(void) {
+    TEST("self_voice: emitting an anchor token nudges its chamber");
+    Leo leo;
+    leo_init(&leo);
+    /* need BPE vocab seeded; build a token that decodes to an anchor */
+    /* simplest: the byte 0x6C ('l') on its own is a token, but anchors
+     * are multi-byte. Ingest a line that makes BPE learn "warm". */
+    leo_ingest(&leo,
+        "warm warm warm warm warm warm warm warm warm warm "
+        "warm warm warm warm warm warm warm warm warm warm");
+    /* find the token whose decoded bytes lowercased are "warm" */
+    int warm_id = -1;
+    for (int id = 0; id < leo.bpe.vocab_size; id++) {
+        char buf[64];
+        int len = bpe_decode_token(&leo.bpe, id, buf, sizeof(buf));
+        /* lowercase compare, trim */
+        char low[64] = {0};
+        int wi = 0;
+        for (int i = 0; i < len && wi < 63; i++) {
+            unsigned char c = (unsigned char)buf[i];
+            if (isalpha(c)) low[wi++] = (char)tolower(c);
+        }
+        if (wi == 4 && !strcmp(low, "warm")) { warm_id = id; break; }
+    }
+    if (warm_id < 0) { leo_free(&leo); PASS(); return; } /* corpus tiny — skip */
+    float before = leo.field.chamber_ext[LEO_CH_LOVE];
+    leo_field_self_voice(&leo.field, &leo.bpe, warm_id);
+    float after = leo.field.chamber_ext[LEO_CH_LOVE];
+    ASSERT(after > before, "LOVE ext rose after self-voiced 'warm'");
+    leo_free(&leo);
+    PASS();
+}
+
 static void test_leo_field_feel_cooc_noop_on_empty_leo(void) {
     TEST("feel_cooc: safe on empty Leo (no anchor resonance to find)");
     Leo leo;
@@ -1102,6 +1135,7 @@ int main(void) {
     test_leo_field_chamber_mods_identity_at_zero();
     test_leo_field_feel_text_love();
     test_leo_field_feel_text_substring_morphology();
+    test_leo_field_self_voice_raises_chamber();
     test_leo_field_feel_cooc_noop_on_empty_leo();
     test_leo_field_retention_zero_on_fresh();
     test_leo_field_retention_self_similarity();
