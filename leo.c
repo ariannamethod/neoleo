@@ -846,7 +846,12 @@ static float leo_field_tau_mod(const LeoField *f) {
 }
 
 /* Feed text into chamber external inputs — anchor words drive chambers.
- * Call this once per reply / per prompt. Overwrites previous ext. */
+ * Exact match first (full weight), then substring match (half weight).
+ * Substring covers morphology: "emptied" and "emptying" both hit "empty"
+ * → VOID. Caller clears ext after the reply.
+ *
+ * Minimum prompt-word length of 3 bytes for substring to avoid spurious
+ * matches on short common substrings (e.g. "in" inside "gentle"). */
 static void leo_field_chambers_feel_text(LeoField *f, const char *text) {
     memset(f->chamber_ext, 0, sizeof(f->chamber_ext));
     if (!text) return;
@@ -860,10 +865,25 @@ static void leo_field_chambers_feel_text(LeoField *f, const char *text) {
         }
         if (wi > 0) {
             cur[wi] = 0;
+            int matched = 0;
+            /* exact match — full weight */
             for (size_t i = 0; i < LEO_CH_N_ANCHORS; i++) {
                 if (!strcmp(cur, LEO_CH_ANCHORS[i].word)) {
                     f->chamber_ext[LEO_CH_ANCHORS[i].chamber] += 0.15f;
+                    matched = 1;
                     break;
+                }
+            }
+            /* substring fallback — half weight, covers morphology */
+            if (!matched && wi >= 3) {
+                for (size_t i = 0; i < LEO_CH_N_ANCHORS; i++) {
+                    const char *a = LEO_CH_ANCHORS[i].word;
+                    size_t al = strlen(a);
+                    if (al < 3) continue;
+                    if (strstr(cur, a) || strstr(a, cur)) {
+                        f->chamber_ext[LEO_CH_ANCHORS[i].chamber] += 0.07f;
+                        break;
+                    }
                 }
             }
             wi = 0;
@@ -1623,6 +1643,95 @@ float *compute_prompt_gravity(const Leo *leo, const int *prompt_ids,
  * The mama-child invariant: mother hears the child whining (ingest),
  * feels tired (gravity tilts her field toward her state), answers
  * from her own inner world ("отстань!") — addressed to the child. */
+/* Cooc-based chamber inference — super-token style on BPE level.
+ *
+ * For each prompt word that did NOT match an exact or substring anchor,
+ * we encode it through BPE, take its principal token id, and look up
+ * co-occurrence with each chamber's anchor tokens in the current
+ * `leo->cooc` field. The chamber whose anchors resonate most with the
+ * prompt word gets a small boost.
+ *
+ * This is how Leo's field itself learns which words belong to which
+ * chamber, without us pre-enumerating a huge lexicon. Every ingest
+ * reshapes it. */
+static void leo_field_chambers_feel_cooc(Leo *leo, const char *text) {
+    if (!text) return;
+
+    /* build a tiny per-chamber list of anchor BPE ids for this ingest
+     * state (fast — ~40 encodes of short words) */
+    int  anchor_ids[LEO_N_CHAMBERS][8];
+    int  anchor_n[LEO_N_CHAMBERS] = {0};
+    for (size_t i = 0; i < LEO_CH_N_ANCHORS; i++) {
+        const char *w = LEO_CH_ANCHORS[i].word;
+        int ch = LEO_CH_ANCHORS[i].chamber;
+        if (anchor_n[ch] >= 8) continue;
+        char buf[48];
+        snprintf(buf, sizeof(buf), " %s", w);
+        int ids[16];
+        int n = bpe_encode(&leo->bpe, (const uint8_t *)buf,
+                           (int)strlen(buf), ids, 16);
+        if (n <= 0) continue;
+        /* main token = the longest encoded token in the word */
+        int pick = ids[0], pick_len = leo->bpe.vocab_len[ids[0]];
+        for (int k = 1; k < n; k++) {
+            int L = leo->bpe.vocab_len[ids[k]];
+            if (L > pick_len) { pick = ids[k]; pick_len = L; }
+        }
+        anchor_ids[ch][anchor_n[ch]++] = pick;
+    }
+
+    /* scan prompt words; for each non-matched word, vote */
+    char cur[32];
+    int  wi = 0;
+    for (const char *p = text; ; p++) {
+        unsigned char ch = (unsigned char)*p;
+        if (ch && (isalpha(ch) || ch == '\'')) {
+            if (wi < 31) cur[wi++] = (char)tolower(ch);
+            continue;
+        }
+        if (wi >= 3) {
+            cur[wi] = 0;
+            /* skip exact anchor matches — they were already scored */
+            int is_exact = 0;
+            for (size_t i = 0; i < LEO_CH_N_ANCHORS; i++)
+                if (!strcmp(cur, LEO_CH_ANCHORS[i].word)) { is_exact = 1; break; }
+            if (!is_exact) {
+                /* encode the word and take principal token */
+                char buf[48];
+                snprintf(buf, sizeof(buf), " %s", cur);
+                int ids[16];
+                int n = bpe_encode(&leo->bpe, (const uint8_t *)buf,
+                                   (int)strlen(buf), ids, 16);
+                if (n > 0) {
+                    int p_id = ids[0], plen = leo->bpe.vocab_len[ids[0]];
+                    for (int k = 1; k < n; k++) {
+                        int L = leo->bpe.vocab_len[ids[k]];
+                        if (L > plen) { p_id = ids[k]; plen = L; }
+                    }
+                    float best = 0.0f;
+                    int best_ch = -1;
+                    for (int c = 0; c < LEO_N_CHAMBERS; c++) {
+                        float s = 0;
+                        for (int k = 0; k < anchor_n[c]; k++) {
+                            s += cooc_get(&leo->cooc, p_id, anchor_ids[c][k]);
+                            s += cooc_get(&leo->cooc, anchor_ids[c][k], p_id);
+                        }
+                        if (s > best) { best = s; best_ch = c; }
+                    }
+                    if (best_ch >= 0 && best > 1.0f) {
+                        /* quarter-weight — weaker than substring match */
+                        leo->field.chamber_ext[best_ch] += 0.04f;
+                    }
+                }
+            }
+        }
+        wi = 0;
+        if (!ch) break;
+    }
+    for (int i = 0; i < LEO_N_CHAMBERS; i++)
+        leo->field.chamber_ext[i] = clampf(leo->field.chamber_ext[i], 0, 1);
+}
+
 int leo_respond(Leo *leo, const char *prompt, char *out, int max_len) {
     if (!prompt || !*prompt)
         return leo_chain(leo, LEO_CHAIN_MIN, out, max_len);
@@ -1634,8 +1743,11 @@ int leo_respond(Leo *leo, const char *prompt, char *out, int max_len) {
                           (int)strlen(prompt), p_ids, 1024);
     float *g = compute_prompt_gravity(leo, p_ids, p_n);
 
-    /* body hears the prompt — anchor words drive chambers. */
+    /* body hears the prompt — anchor words drive chambers.
+     * Two passes: exact+substring first, then cooc-inference for the
+     * rest. This is super-token-style emergent anchor detection. */
     leo_field_chambers_feel_text(&leo->field, prompt);
+    leo_field_chambers_feel_cooc(leo, prompt);
 
     leo->gravity = g;
     int produced = leo_chain(leo, LEO_CHAIN_MIN, out, max_len);

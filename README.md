@@ -102,6 +102,34 @@ Runs the test suite (33 tests at the moment, all green).
 - +5 tests (42 total).
 - commit `fcd7a79`.
 
+### step 15 — chamber anchors: substring + cooc-inference (super-token style)
+
+The original anchor list of ~40 words rarely intersected with the
+observer's vocabulary — chambers stayed at zero across most selfplay
+turns. Two widening strategies added.
+
+- **Substring match** — in `leo_field_chambers_feel_text`, after the
+  exact-match pass fails, a second pass checks whether the word
+  contains an anchor (or vice versa) and raises the chamber at half
+  weight. `"emptying"` and `"empties"` now both hit `VOID` through
+  the root `"empty"`. Minimum word length of 3 to avoid spurious hits.
+
+- **Cooc-inference** — `leo_field_chambers_feel_cooc` (called right
+  after `feel_text`). For every prompt word that did not match
+  exact/substring, encode it through BPE, take the principal token,
+  and look up co-occurrence in Leo's field against each chamber's
+  anchor tokens. The chamber whose anchors resonate most gets a
+  quarter-weight boost. This is **super-token style on BPE level**:
+  the field itself learns which words belong to which chamber
+  through ingestion — no pre-enumerated lexicon.
+
+Selfplay observation:
+- Turn 1 prompt "heart today" → chambers 0 (no anchor, field too fresh)
+- Turn 2 prompt "warm smell" → LOVE 1.00, VOID 0.10, FLOW 0.10
+  ("warm" exact + "smell" via cooc-inference through "warm"/"love")
+
++2 tests (66 total). Substring morphology, cooc-inference no-op on empty Leo.
+
 ### step 14 — word-completion gate + live stats
 
 Two small fixes that cleaned the voice and made growth visible.

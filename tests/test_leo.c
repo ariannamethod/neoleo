@@ -910,6 +910,32 @@ static void test_leo_field_feel_text_love(void) {
     PASS();
 }
 
+static void test_leo_field_feel_text_substring_morphology(void) {
+    TEST("chambers_feel_text: substring match catches morphology (empties → VOID)");
+    LeoField f;
+    leo_field_init(&f, 128);
+    /* "emptying" is not an exact anchor but contains "empty" — substring
+     * match should raise VOID at the half-weight level. */
+    leo_field_chambers_feel_text(&f, "emptying the pocket");
+    ASSERT(f.chamber_ext[LEO_CH_VOID] > 0.0f,
+           "VOID raised by substring anchor");
+    leo_field_free(&f);
+    PASS();
+}
+
+static void test_leo_field_feel_cooc_noop_on_empty_leo(void) {
+    TEST("feel_cooc: safe on empty Leo (no anchor resonance to find)");
+    Leo leo;
+    leo_init(&leo);
+    leo_field_chambers_feel_cooc(&leo, "shoes hallway attic");
+    /* no ingest done — cooc is empty, nothing should be raised */
+    for (int i = 0; i < LEO_N_CHAMBERS; i++)
+        ASSERT(leo.field.chamber_ext[i] == 0.0f,
+               "no chamber drive without a populated field");
+    leo_free(&leo);
+    PASS();
+}
+
 static void test_leo_field_retention_zero_on_fresh(void) {
     TEST("retention: bias ≈ 0 on fresh field (state is zero)");
     LeoField f;
@@ -1075,6 +1101,8 @@ int main(void) {
     test_leo_field_chambers_clamped();
     test_leo_field_chamber_mods_identity_at_zero();
     test_leo_field_feel_text_love();
+    test_leo_field_feel_text_substring_morphology();
+    test_leo_field_feel_cooc_noop_on_empty_leo();
     test_leo_field_retention_zero_on_fresh();
     test_leo_field_retention_self_similarity();
     test_leo_field_retention_gamma_decay();
