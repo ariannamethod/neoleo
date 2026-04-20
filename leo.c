@@ -1406,6 +1406,58 @@ static float leo_field_temperature_mult(const LeoField *f);
 static void  leo_field_step(LeoField *f, int emitted, float coherence_hint);
 
 /* small byte helpers for the word-completion gate */
+/* Common short alpha words (≤3 chars) that are legitimately whole words.
+ * Anything else short + alpha-only is almost certainly a BPE fragment
+ * masquerading as a standalone word between space and punctuation. */
+static int is_common_short_word(const uint8_t *bytes, int start, int end) {
+    int len = end - start;
+    if (len < 1 || len > 3) return 0;
+    char low[4] = {0};
+    for (int i = 0; i < len; i++) {
+        uint8_t c = bytes[start + i];
+        if (c >= 'A' && c <= 'Z') c = (uint8_t)(c - 'A' + 'a');
+        low[i] = (char)c;
+    }
+    low[len] = 0;
+    static const char *wl[] = {
+        "a","i","o",
+        "ah","oh","hi","no","so","is","it","an","at","be","by","do","go",
+        "he","if","in","me","my","of","on","or","to","up","us","we","am",
+        "us","as","ok","yo",
+        "the","and","but","you","she","her","his","its","all","how","who",
+        "why","our","out","ago","any","let","now","day","one","two","six",
+        "ten","new","old","yes","far","saw","got","gee","oh ",
+        NULL
+    };
+    for (int i = 0; wl[i]; i++) if (!strcmp(low, wl[i])) return 1;
+    return 0;
+}
+
+/* A token is an "orphan fragment" if its decoded content (ignoring any
+ * leading/trailing whitespace) is pure letters, length 1 or 2, and not
+ * in the common-short-word whitelist. Examples: "m", "s", " p", "wo ".
+ * Examples that pass: " a", "I", "the", "Leo" (length 3 not flagged),
+ * " hi", " no". Worth rejecting even when prev is a clean space — we
+ * just don't want Leo emitting "m" as a standalone word. */
+static int is_orphan_fragment(const BPE *bpe, int id) {
+    if (id < 0 || id >= bpe->vocab_size) return 0;
+    int len = bpe->vocab_len[id];
+    if (len == 0) return 0;
+    const uint8_t *b = bpe->vocab_bytes[id];
+    int s = 0, e = len;
+    while (s < e && (b[s] == ' ' || b[s] == '\n' || b[s] == '\r' || b[s] == '\t')) s++;
+    while (e > s && (b[e-1] == ' ' || b[e-1] == '\n' || b[e-1] == '\r' || b[e-1] == '\t')) e--;
+    if (s == e) return 0;
+    for (int i = s; i < e; i++) {
+        uint8_t c = b[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) return 0;
+    }
+    int clen = e - s;
+    if (clen >= 3) return 0;                              /* long enough */
+    if (is_common_short_word(b, s, e)) return 0;          /* real short word */
+    return 1;
+}
+
 static int bpe_token_first_byte(const BPE *bpe, int id) {
     if (id < 0 || id >= bpe->vocab_size || bpe->vocab_len[id] == 0) return 0;
     return bpe->vocab_bytes[id][0];
@@ -1456,6 +1508,10 @@ static float word_gate_penalty(const CandCollector2 *cc, int cand_id) {
 static int cand_collect_tri(int c, float count, void *ud) {
     CandCollector2 *cc = (CandCollector2 *)ud;
     if (cc->n >= cc->max) return 1;
+    /* real-word gate: reject orphan fragments outright. If all
+     * candidates turn out to be orphans, the step falls back to
+     * choose_start (clean-seed tokens), so we never emit "m" */
+    if (cc->bpe && is_orphan_fragment(cc->bpe, c)) return 0;
     float s = cooc_get(cc->cooc, cc->prev1, c);
     float score = 0.7f * count + 0.3f * s;
     if (cc->gravity) {
@@ -1474,6 +1530,7 @@ static int cand_collect_tri(int c, float count, void *ud) {
 static int cand_collect_bi(int dst, float count, void *ud) {
     CandCollector2 *cc = (CandCollector2 *)ud;
     if (cc->n >= cc->max) return 1;
+    if (cc->bpe && is_orphan_fragment(cc->bpe, dst)) return 0;
     float score = count;
     if (cc->gravity) {
         float alpha = cc->field ? leo_field_alpha_mod(cc->field) : 1.0f;
