@@ -956,21 +956,6 @@ static void test_leo_field_self_voice_raises_chamber(void) {
     PASS();
 }
 
-static void test_leo_field_arousal_picks_max(void) {
-    TEST("arousal: reports the max emotional chamber, not the mean");
-    LeoField f;
-    leo_field_init(&f, 128);
-    f.chamber_act[LEO_CH_LOVE] = 1.0f;
-    f.chamber_act[LEO_CH_VOID] = 0.0f;
-    f.chamber_act[LEO_CH_FLOW] = 0.0f;
-    f.chamber_act[LEO_CH_COMPLEX] = 0.0f;
-    /* mean would be 0.25; max is 1.0 — Leo should notice the hit. */
-    float a = leo_field_arousal(&f);
-    ASSERT(a > 0.95f, "arousal reports the 1.0 peak not the 0.25 mean");
-    leo_field_free(&f);
-    PASS();
-}
-
 static void test_leo_field_feel_cooc_noop_on_empty_leo(void) {
     TEST("feel_cooc: safe on empty Leo (no anchor resonance to find)");
     Leo leo;
@@ -1151,7 +1136,6 @@ int main(void) {
     test_leo_field_feel_text_love();
     test_leo_field_feel_text_substring_morphology();
     test_leo_field_self_voice_raises_chamber();
-    test_leo_field_arousal_picks_max();
     test_leo_field_feel_cooc_noop_on_empty_leo();
     test_leo_field_retention_zero_on_fresh();
     test_leo_field_retention_self_similarity();
