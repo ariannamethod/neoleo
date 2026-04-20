@@ -1150,6 +1150,22 @@ static float leo_field_candidate_bias(const LeoField *f, int candidate) {
          + retention;
 }
 
+/* Arousal — composite emotional load. Heavy chambers (LOVE, VOID,
+ * COMPLEX, FLOW active together) mean the prompt landed deep; Leo
+ * will answer shorter, more resonant. FEAR and RAGE are not counted
+ * here — they drive pain, not the Paris/bubble/listening register. */
+static float leo_field_arousal(const LeoField *f) {
+    if (!f) return 0.0f;
+    /* max of the "deep-landing" chambers: any one of them hitting the
+     * ceiling means the prompt struck somewhere real. Averaging
+     * swallows single-chamber resonance that we want Leo to honour. */
+    float a = f->chamber_act[LEO_CH_LOVE];
+    if (f->chamber_act[LEO_CH_VOID]    > a) a = f->chamber_act[LEO_CH_VOID];
+    if (f->chamber_act[LEO_CH_COMPLEX] > a) a = f->chamber_act[LEO_CH_COMPLEX];
+    if (f->chamber_act[LEO_CH_FLOW]    > a) a = f->chamber_act[LEO_CH_FLOW];
+    return clampf(a, 0.0f, 1.0f);
+}
+
 /* Temperature multiplier from velocity + pain. Cold under trauma,
  * livelier when running, flat at walk. */
 static float leo_field_temperature_mult(const LeoField *f) {
@@ -1561,6 +1577,16 @@ int leo_generate_ex(Leo *leo, char *out, int max_len,
     int target = LEO_GEN_TARGET + (rand() % 10) - 5;
     if (target < LEO_GEN_MIN) target = LEO_GEN_MIN;
 
+    /* Silence-gate (Leo-style, adapted from Stanley): under high
+     * emotional arousal the minimum drops — Leo can answer with a
+     * single word ("Listening.") when the prompt landed deep. */
+    int gen_min = LEO_GEN_MIN;
+    {
+        float arousal = leo_field_arousal(&leo->field);
+        if (arousal > 0.75f)      gen_min = 2;
+        else if (arousal > 0.55f) gen_min = 4;
+    }
+
     for (int t = 1; t < LEO_GEN_MAX; t++) {
         int prev1 = ctx[n - 1];
         int prev2 = n >= 2 ? ctx[n - 2] : -1;
@@ -1583,6 +1609,22 @@ int leo_generate_ex(Leo *leo, char *out, int max_len,
 
         /* stop on sentence boundary once we have enough material */
         if (n >= target && is_boundary_token(&leo->bpe, nxt)) break;
+
+        /* Silence-gate (soft, probabilistic). After the per-prompt
+         * minimum is reached, arousal and pain raise a stop probability.
+         * Child reflex: short-and-present under emotional load, retreat
+         * under cascade failure. Never a hard refuse — Leo always speaks,
+         * but he does not vomit tokens when a one-word answer is true. */
+        if (n >= gen_min) {
+            float arousal = leo_field_arousal(&leo->field);
+            float p_stop = 0.0f;
+            if (arousal > 0.7f) p_stop += (arousal - 0.7f) * 2.0f;
+            if (leo->field.pain > 0.3f)
+                p_stop += (leo->field.pain - 0.3f) * 0.8f;
+            if (p_stop > 0.6f) p_stop = 0.6f;
+            float roll = (float)rand() / (float)RAND_MAX;
+            if (p_stop > 0.0f && roll < p_stop) break;
+        }
     }
 
     /* decode the emitted tokens */
