@@ -460,6 +460,115 @@ static void test_is_orphan_fragment_detects_shorts(void) {
     PASS();
 }
 
+/* Helper: find the first BPE token id whose bytes begin with `first`.
+ * Used by word-boundary gate tests to drive realistic candidate ids. */
+static int find_token_starting_with(const BPE *bpe, uint8_t first) {
+    for (int i = 0; i < bpe->vocab_size; i++) {
+        if (bpe->vocab_len[i] > 0 && bpe->vocab_bytes[i][0] == first)
+            return i;
+    }
+    return -1;
+}
+
+static void test_word_gate_crushes_capital_after_alpha_tail(void) {
+    TEST("word_gate_penalty: capital-alpha after alpha-tail crushed to 0");
+    BPE bpe;
+    bpe_init(&bpe);
+    int he_id = find_token_starting_with(&bpe, (uint8_t)'H');
+    ASSERT(he_id >= 0, "byte 'H' token exists");
+    CandCollector cc = {0};
+    cc.bpe = &bpe;
+    cc.prev_ends_alpha = 1;     /* previous token ended mid-word ("catalo") */
+    float p = word_gate_penalty(&cc, he_id);
+    ASSERT(p == 0.0f, "capital-start after alpha-tail crushed to exactly 0");
+    PASS();
+}
+
+static void test_word_gate_allows_lowercase_continuation(void) {
+    TEST("word_gate_penalty: lowercase-alpha continuation un-penalised");
+    BPE bpe;
+    bpe_init(&bpe);
+    int ty_id = find_token_starting_with(&bpe, (uint8_t)'t');
+    ASSERT(ty_id >= 0, "byte 't' token exists");
+    CandCollector cc = {0};
+    cc.bpe = &bpe;
+    cc.prev_ends_alpha = 1;     /* previous token ended mid-word ("emp") */
+    float p = word_gate_penalty(&cc, ty_id);
+    ASSERT(p == 1.0f, "legitimate continuation passes (penalty 1.0)");
+    PASS();
+}
+
+static void test_word_gate_allows_space_or_punct_close(void) {
+    TEST("word_gate_penalty: space / punct after alpha-tail un-penalised");
+    BPE bpe;
+    bpe_init(&bpe);
+    int sp_id  = find_token_starting_with(&bpe, (uint8_t)' ');
+    int dot_id = find_token_starting_with(&bpe, (uint8_t)'.');
+    ASSERT(sp_id >= 0 && dot_id >= 0, "byte tokens for space and '.' exist");
+    CandCollector cc = {0};
+    cc.bpe = &bpe;
+    cc.prev_ends_alpha = 1;
+    ASSERT(word_gate_penalty(&cc, sp_id) == 1.0f,  "space closes word cleanly");
+    ASSERT(word_gate_penalty(&cc, dot_id) == 1.0f, "period closes word cleanly");
+    PASS();
+}
+
+static void test_word_gate_allows_capital_after_nonalpha(void) {
+    TEST("word_gate_penalty: capital-alpha passes when prev ended non-alpha");
+    BPE bpe;
+    bpe_init(&bpe);
+    int he_id = find_token_starting_with(&bpe, (uint8_t)'H');
+    ASSERT(he_id >= 0, "byte 'H' token exists");
+    CandCollector cc = {0};
+    cc.bpe = &bpe;
+    cc.prev_ends_alpha = 0;     /* previous token ended with space / '.' */
+    float p = word_gate_penalty(&cc, he_id);
+    ASSERT(p == 1.0f, "capital at sentence start is legitimate");
+    PASS();
+}
+
+static void test_word_gate_crushes_capital_after_apostrophe(void) {
+    TEST("word_gate_penalty: capital-alpha after apostrophe crushed (you'He)");
+    BPE bpe;
+    bpe_init(&bpe);
+    int he_id = find_token_starting_with(&bpe, (uint8_t)'H');
+    ASSERT(he_id >= 0, "byte 'H' token exists");
+    CandCollector cc = {0};
+    cc.bpe = &bpe;
+    /* prev_ends_alpha is set in step_token via byte_is_word_cont which
+     * treats apostrophe as a word-tail byte (so "Leo's" stays one word).
+     * A capital after such a tail is still cross-sentence glue. */
+    cc.prev_ends_alpha = 1;
+    float p = word_gate_penalty(&cc, he_id);
+    ASSERT(p == 0.0f, "capital-after-apostrophe-tail crushed");
+    ASSERT(is_capital_glue_cand(&cc, he_id) == 1, "collector also hard-skips");
+    PASS();
+}
+
+static void test_capital_glue_hard_excluded_by_collector(void) {
+    TEST("is_capital_glue_cand: hard-skip capital after alpha-tail");
+    BPE bpe;
+    bpe_init(&bpe);
+    int he_id = find_token_starting_with(&bpe, (uint8_t)'H');
+    int lc_id = find_token_starting_with(&bpe, (uint8_t)'t');
+    int sp_id = find_token_starting_with(&bpe, (uint8_t)' ');
+    ASSERT(he_id >= 0 && lc_id >= 0 && sp_id >= 0,
+           "required byte tokens exist");
+
+    CandCollector cc = {0};
+    cc.bpe = &bpe;
+
+    cc.prev_ends_alpha = 1;
+    ASSERT(is_capital_glue_cand(&cc, he_id) == 1, "capital after alpha → skip");
+    ASSERT(is_capital_glue_cand(&cc, lc_id) == 0, "lowercase after alpha → keep");
+    ASSERT(is_capital_glue_cand(&cc, sp_id) == 0, "space after alpha → keep");
+
+    cc.prev_ends_alpha = 0;
+    ASSERT(is_capital_glue_cand(&cc, he_id) == 0, "capital after non-alpha → keep");
+
+    PASS();
+}
+
 static void test_leo_step_token_uses_bigram_fallback(void) {
     TEST("leo_step_token: falls back gracefully when candidates excluded");
     Leo leo;
@@ -1128,6 +1237,12 @@ int main(void) {
     test_weighted_sample_peaked();
     test_leo_choose_start_after_ingest();
     test_is_orphan_fragment_detects_shorts();
+    test_word_gate_crushes_capital_after_alpha_tail();
+    test_word_gate_allows_lowercase_continuation();
+    test_word_gate_allows_space_or_punct_close();
+    test_word_gate_allows_capital_after_nonalpha();
+    test_word_gate_crushes_capital_after_apostrophe();
+    test_capital_glue_hard_excluded_by_collector();
     test_leo_step_token_uses_bigram_fallback();
     test_leo_generate_produces_output();
     test_leo_generate_starts_upper_ends_punct();

@@ -1466,12 +1466,21 @@ static int bpe_token_last_byte(const BPE *bpe, int id) {
     if (id < 0 || id >= bpe->vocab_size || bpe->vocab_len[id] == 0) return 0;
     return bpe->vocab_bytes[id][bpe->vocab_len[id] - 1];
 }
-static int byte_is_alpha_lower(uint8_t c) {
-    return c >= 'a' && c <= 'z';
-}
+/* prev_ends_alpha detector: any alpha byte (upper or lower) at the tail
+ * of the previous token means "we are mid-word". Apostrophe counts
+ * (don't, Leo's) so that "Leo's" + next doesn't get treated as glue. */
 static int byte_is_word_cont(uint8_t c) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
            (c >= '0' && c <= '9') || c == '\'';
+}
+/* Legitimate in-word continuation for the word-completion gate.
+ * Uppercase is deliberately *excluded* here: in child-voice corpus an
+ * uppercase-alpha byte at the start of a token after an alpha tail is
+ * never a word continuation — it is a cross-sentence token-glue
+ * ("catalo" + "He" → "cataloHe"). Uppercase gets crushed/skipped
+ * separately. */
+static int byte_is_word_cont_lower(uint8_t c) {
+    return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '\'';
 }
 
 typedef struct {
@@ -1491,18 +1500,41 @@ typedef CandCollector CandCollector2; /* transitional alias */
 
 /* word-completion penalty. When the previous token ended mid-word
  * (last byte is alpha), the next token must either continue the word
- * (starts with alpha) or deliberately close it (space or punctuation).
- * Tokens that leave Leo with a mid-word fragment get their score
- * crushed — this is the "emp" → "empty" vs "emp " fix. */
+ * in lowercase (legitimate BPE continuation) or deliberately close it
+ * (space or punctuation). Two pathologies get crushed:
+ *   1) orphan glue — `emp`→`X` where X is neither continuation nor
+ *      terminator (digit glue only happens in strange corpora but the
+ *      gate stays permissive here: digits count as continuation).
+ *   2) capital glue — `catalo`→`He`: uppercase-alpha after alpha-tail
+ *      is almost always a new-sentence token slammed onto a stray
+ *      fragment. In child-voice corpus uppercase mid-word is zero. */
 static float word_gate_penalty(const CandCollector2 *cc, int cand_id) {
     if (!cc->bpe || !cc->prev_ends_alpha) return 1.0f;
     int first = bpe_token_first_byte(cc->bpe, cand_id);
-    /* continuation or clean word ending both fine */
-    if (byte_is_word_cont((uint8_t)first)) return 1.0f;
+    /* lowercase alpha / digit / apostrophe — legitimate continuation */
+    if (byte_is_word_cont_lower((uint8_t)first)) return 1.0f;
+    /* clean word boundary — whitespace / punctuation closes the word */
     if (first == ' ' || first == '\n' || first == '\r' || first == '\t') return 1.0f;
     if (first == '.' || first == ',' || first == '!' || first == '?' ||
         first == ';' || first == ':') return 1.0f;
+    /* uppercase-alpha after alpha-tail — token-glue across sentence
+     * boundary. Crush hard so a clean continuation wins decisively even
+     * against a strong cooccurrence prior. (Hard-exclude in the
+     * collector also handles this, but the penalty is kept as a second
+     * line of defence.) */
+    if (first >= 'A' && first <= 'Z') return 0.0f;
     return 0.02f; /* orphan: crush 50× so continuation reliably wins */
+}
+
+/* Hard exclusion for the candidate collector. Uppercase-alpha after an
+ * alpha-ended token is cross-sentence token-glue ("cataloHe", "whiShe").
+ * Multiplicative penalty alone can be overpowered by very large base
+ * cooc/bigram counts; skipping the candidate outright ensures no
+ * temperature schedule or field bias can resurrect it. */
+static int is_capital_glue_cand(const CandCollector2 *cc, int cand_id) {
+    if (!cc->bpe || !cc->prev_ends_alpha) return 0;
+    int first = bpe_token_first_byte(cc->bpe, cand_id);
+    return first >= 'A' && first <= 'Z';
 }
 
 static int cand_collect_tri(int c, float count, void *ud) {
@@ -1512,6 +1544,8 @@ static int cand_collect_tri(int c, float count, void *ud) {
      * candidates turn out to be orphans, the step falls back to
      * choose_start (clean-seed tokens), so we never emit "m" */
     if (cc->bpe && is_orphan_fragment(cc->bpe, c)) return 0;
+    /* boundary gate: hard-exclude capital-after-alpha glue */
+    if (is_capital_glue_cand(cc, c)) return 0;
     float s = cooc_get(cc->cooc, cc->prev1, c);
     float score = 0.7f * count + 0.3f * s;
     if (cc->gravity) {
@@ -1531,6 +1565,7 @@ static int cand_collect_bi(int dst, float count, void *ud) {
     CandCollector2 *cc = (CandCollector2 *)ud;
     if (cc->n >= cc->max) return 1;
     if (cc->bpe && is_orphan_fragment(cc->bpe, dst)) return 0;
+    if (is_capital_glue_cand(cc, dst)) return 0;
     float score = count;
     if (cc->gravity) {
         float alpha = cc->field ? leo_field_alpha_mod(cc->field) : 1.0f;
@@ -1561,7 +1596,15 @@ int leo_step_token(const Leo *leo, int prev2, int prev1, float temp) {
         trigram_walk_ab(&leo->trigrams, prev2, prev1, cand_collect_tri, &cc);
     if (cc.n == 0)
         bigram_walk_src(&leo->bigrams, prev1, cand_collect_bi, &cc);
-    if (cc.n == 0) return leo_choose_start(leo);
+    if (cc.n == 0) {
+        /* Stuck mid-word: prev ended alpha and no legitimate continuation
+         * survived the gates. Emit a literal space so the fragment closes
+         * cleanly; the *next* step opens a new word with a proper boundary
+         * instead of gluing a capital-start onto the alpha-tail
+         * (e.g. "whi" + choose_start "It" → "whiIt"). */
+        if (prev_ends_alpha) return 32; /* ASCII ' ' */
+        return leo_choose_start(leo);
+    }
 
     for (int i = 0; i < cc.n; i++)
         cand_sc[i] = powf(cand_sc[i], inv_temp);
