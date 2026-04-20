@@ -1,0 +1,7 @@
+leo
+leo_dbg
+tests/test_leo
+*.o
+*.a
+*.dSYM/
+.DS_Store

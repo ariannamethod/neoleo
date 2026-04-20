@@ -102,6 +102,106 @@ Runs the test suite (33 tests at the moment, all green).
 - +5 tests (42 total).
 - commit `fcd7a79`.
 
+### step 22 — boundary gate: hard-exclude capital-after-alpha glue
+
+The child-voice corpus never puts an upper-case alpha in the middle of
+a word. Yet `./leo --demo` kept producing cross-sentence glue —
+`cataloHe`, `sheHe`, `tastHe`, `gooShe`, `you'He`, `peaHis`, `thaHis`,
+`kneHe`, `iHe`, `differenHe`, `peaThe`, `abouSome`, `abouLeo`,
+`whiShe`, `begHe`, `IThe`, `BottA` — because `byte_is_word_cont`
+counted uppercase as a legitimate continuation. `word_gate_penalty`
+returned 1.0 for `catalo`→`He`, the weighted sampler happily picked
+the capital-start token mid-word, and the letters slammed together in
+the output.
+
+Fix is layered so no single path can resurrect a glue candidate.
+
+- `byte_is_word_cont_lower` — new helper covering only lowercase,
+  digit, apostrophe. `byte_is_word_cont` stays as the
+  `prev_ends_alpha` detector (uppercase tails are still alpha).
+- `word_gate_penalty` — capital after alpha-tail → `0.0` (hard crush).
+  Lowercase continuation and whitespace / punctuation close still pass
+  at `1.0`.
+- `is_capital_glue_cand` — hard-exclude in `cand_collect_tri` and
+  `cand_collect_bi`. The multiplicative penalty alone can be
+  overpowered by very large cooc / bigram priors, so the collector
+  drops glue candidates outright. No temperature schedule or field
+  bias can bring them back.
+- `leo_step_token` fallback — when every continuation is gated out
+  and prev ended alpha, emit a literal space (ASCII 32) instead of
+  calling `leo_choose_start`. `choose_start` returns capital-prefixed
+  tokens which would themselves glue to the alpha-tail
+  (`whi` + `It` → `whiIt`). The space opens a fresh word boundary.
+
+Verification — 20 `--demo` runs, same corpus, same seed distribution:
+
+- Before (`7fac64f`): double-digit capital-glue patterns per session,
+  concentrated in chain mode where fallback + start tokens interact.
+- After (`d23fd2e`): `grep -E "[a-z'][A-Z]"` → **0 matches** across
+  242 output lines.
+
+Live lines after the gate:
+
+> *He has been a reading for afternoon. Leo has noticed. He is a small
+> aiat the beginning. He is looking at his window.*
+>
+> *The world. He has watched. Leo fill the oven the sun. He is the
+> only one who is not sure it is in his head.*
+>
+> *The quiet braveries for him. The ant does not worried if he is a
+> friend in the morning.*
+
+Remaining child-voice warts — `aime`, `aight`, `ome`, `a a a a a ome`
+— are 3-char BPE orphans and fallback-chain artefacts, addressed
+separately.
+
++6 tests (74 total). commit `d23fd2e`.
+
+### step 21 — real-word gate (short alpha-only fragments)
+
+Single-byte and two-byte alpha-only BPE tokens (`m`, `s`, `p`, `Wo`,
+`wh`) were emitting as standalone words between spaces and punctuation
+— "A m.", "Was not s.", "Wo it no". They passed every earlier gate
+because their *position* (space–letter–period) was grammatically legal;
+the rejection had to be on the token's *identity*, not its position.
+
+- `is_orphan_fragment(bpe, id)` returns 1 if the token's stripped
+  content is alpha-only, length 1 or 2, and not in a common-short-word
+  whitelist (`a i o an at be by do he if in me my of on or to up us
+  we the and ...`).
+- `CandCollector` hard-excludes orphans from both the trigram and
+  bigram cascades. If every candidate is an orphan (tiny-corpus case),
+  `step_token` falls back to `choose_start`.
+
+Before → after on the isolated-sentence pass:
+
+> *"I love you, Leo."* → *"Window. He is a room. He tended it. When he
+> does. He has seen. He is in the way a handful of his mother's laught."*
+
+No more `A m.` / `Was not s.` / `Wo it no`. Short 4-letter BPE
+fragments (`aime`, `aient`) still surface — those are above the ≤2
+threshold. Raising to ≤3 requires a broader whitelist; deferred.
+
++1 test (68 total). commit `7fac64f`.
+
+### step 20 — word-gate crush tightened (0.25 → 0.02)
+
+Previous `word_gate_penalty` returned `0.25` for orphan continuations
+— not enough against a strong cooccurrence prior, so the gate leaked
+in roughly one run in five. Crushed to `0.02` (50×), legitimate
+continuations win decisively.
+
+commit `85f8a9f`.
+
+### steps 18–19 — silence-gate attempt #1, reverted
+
+Stanley's refuse-gate, ported soft for child voice: when arousal + pain
+crossed a threshold, the generator would break mid-sentence and emit
+`"Listening."`. In practice the break happened inside word clusters and
+left fragment-like stubs — *"Leo has. It is a. He thinks."* — which is
+the opposite of presence. Reverted (`b17138c`). The concept is kept
+for a second attempt after the real-word gate clears the ground.
+
 ### step 16 — anchor lexicon expansion (40 → 325) + self-voice chamber feed
 
 Two reinforcing additions that made chambers responsive.
