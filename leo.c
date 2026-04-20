@@ -1450,7 +1450,7 @@ static float word_gate_penalty(const CandCollector2 *cc, int cand_id) {
     if (first == ' ' || first == '\n' || first == '\r' || first == '\t') return 1.0f;
     if (first == '.' || first == ',' || first == '!' || first == '?' ||
         first == ';' || first == ':') return 1.0f;
-    return 0.25f; /* otherwise: this token orphans the previous word */
+    return 0.02f; /* orphan: crush 50× so continuation reliably wins */
 }
 
 static int cand_collect_tri(int c, float count, void *ud) {
