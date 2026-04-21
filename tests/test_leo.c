@@ -1163,6 +1163,53 @@ static void test_leo_prompt_knowledge_low_for_foreign(void) {
     PASS();
 }
 
+static void test_leo_state_save_load_roundtrip(void) {
+    TEST("leo_save_state / leo_load_state: full organism roundtrip");
+    const char *path = "/tmp/neoleo_test.state";
+    Leo a, b;
+    leo_init(&a);
+    leo_ingest(&a,
+        "Leo watches the rain. The rain is soft. Leo listens. "
+        "The light comes in yellow. Leo has a stone. He waits. "
+        "The room is quiet. The quiet has weight. Leo hears it.");
+    a.field.pain = 0.35f; a.field.trauma = a.field.pain * a.field.pain;
+    a.field.chamber_act[LEO_CH_FEAR] = 0.6f;
+    a.step = 4242;
+
+    ASSERT(leo_save_state(&a, path), "save succeeds");
+
+    leo_init(&b);
+    ASSERT(leo_load_state(&b, path), "load succeeds");
+
+    ASSERT(b.step == a.step, "step preserved");
+    ASSERT(b.bpe.n_merges == a.bpe.n_merges, "n_merges preserved");
+    ASSERT(b.bpe.vocab_size == a.bpe.vocab_size, "vocab_size preserved");
+    ASSERT(b.cooc.total_tokens == a.cooc.total_tokens, "total_tokens preserved");
+    /* Live cooc entries must all match. */
+    for (int i = 0; i < a.cooc.capacity; i++) {
+        if (a.cooc.entries[i].count <= 0) continue;
+        float cb = cooc_get(&b.cooc,
+                            a.cooc.entries[i].src,
+                            a.cooc.entries[i].dst);
+        ASSERT(cb == a.cooc.entries[i].count, "cooc entry preserved");
+    }
+    ASSERT(b.field.pain == a.field.pain, "pain preserved");
+    ASSERT(b.field.trauma == a.field.trauma, "trauma preserved");
+    ASSERT(b.field.chamber_act[LEO_CH_FEAR] == a.field.chamber_act[LEO_CH_FEAR],
+           "FEAR chamber preserved");
+
+    /* Speech smoke test — generation must run on the loaded organism. */
+    char buf[512];
+    int produced = leo_generate(&b, buf, sizeof(buf));
+    ASSERT(produced > 0, "loaded organism can still speak");
+    ASSERT(strlen(buf) > 0, "speech output non-empty");
+
+    leo_free(&a);
+    leo_free(&b);
+    remove(path);
+    PASS();
+}
+
 static void test_leo_silence_gate_shortens_under_trauma(void) {
     TEST("silence-gate #2: high trauma shortens sentences (hush, not refuse)");
     Leo leo;
@@ -1180,9 +1227,10 @@ static void test_leo_silence_gate_shortens_under_trauma(void) {
         "The morning comes quietly. Leo holds his breath. ";
     for (int k = 0; k < 8; k++) leo_ingest(&leo, corpus);
 
-    /* Baseline: no trauma, run 10 trials, sum tokens emitted. */
+    /* Baseline: no trauma, run 20 trials, sum tokens emitted. */
     int baseline_total = 0;
-    for (int k = 0; k < 10; k++) {
+    srand(12345); /* deterministic seed so the test does not flake */
+    for (int k = 0; k < 20; k++) {
         char buf[512];
         int ids[LEO_GEN_MAX]; int cap = LEO_GEN_MAX;
         leo.field.pain = 0.0f;
@@ -1197,7 +1245,8 @@ static void test_leo_silence_gate_shortens_under_trauma(void) {
 
     /* High trauma + FEAR: hush should shorten sentences on average. */
     int hush_total = 0;
-    for (int k = 0; k < 10; k++) {
+    srand(12345); /* same seed for an apples-to-apples comparison */
+    for (int k = 0; k < 20; k++) {
         char buf[512];
         int ids[LEO_GEN_MAX]; int cap = LEO_GEN_MAX;
         leo.field.pain = 0.95f;
@@ -1213,7 +1262,7 @@ static void test_leo_silence_gate_shortens_under_trauma(void) {
      * not gag. But hush must be strictly shorter, otherwise the gate
      * is not firing at all. */
     ASSERT(hush_total < baseline_total,
-           "hush emits fewer tokens total than baseline across 10 trials");
+           "hush emits fewer tokens total than baseline across 20 trials");
     leo_free(&leo);
     PASS();
 }
@@ -1635,6 +1684,7 @@ int main(void) {
     test_leo_low_freq_alpha_fragment_skips_unseen_5_8_tokens();
     test_leo_prompt_knowledge_low_for_foreign();
     test_leo_silence_gate_shortens_under_trauma();
+    test_leo_state_save_load_roundtrip();
     test_leo_field_trauma_trigger_raises_pain_and_chambers();
     test_leo_respond_empty_prompt_falls_back();
     test_embedded_bootstrap_is_nonempty();

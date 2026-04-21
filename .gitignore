@@ -5,3 +5,7 @@ tests/test_leo
 *.a
 *.dSYM/
 .DS_Store
+
+# runtime state — personal per Leo instance, regenerated from corpus + dialogue
+leo.state
+*.state

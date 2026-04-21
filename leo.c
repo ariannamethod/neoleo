@@ -1208,6 +1208,250 @@ void leo_free(Leo *leo) {
     leo_field_free(&leo->field);
 }
 
+/* ========================================================================
+ * STATE PERSISTENCE — leo_save_state / leo_load_state
+ *
+ * Binary format, little-endian, one file per organism. No external deps.
+ * Layout:
+ *
+ *   header       : LEOS magic + version + step
+ *   bpe          : merges + vocab_size + per-token (len, bytes)
+ *   cooc         : freq[] + total_tokens + compact entries
+ *   bigrams      : compact entries (next_src rebuilt on load)
+ *   trigrams     : compact entries (next_ab rebuilt on load)
+ *   field        : scalars + chambers + prophecies + scars +
+ *                  bootstrap_ids + destiny_bag + w_embed +
+ *                  retention_state
+ *
+ * Only observable state persists. Pair-counter hash + reverse indexes
+ * are rebuilt on load by replaying entries through the live update
+ * functions — simpler and keeps the on-disk format compact.
+ * ======================================================================== */
+
+#define LEO_STATE_MAGIC   0x5300454C   /* "LE\0S" — little-endian LEOS */
+#define LEO_STATE_VERSION 1
+
+static int write_u32(FILE *f, uint32_t v) { return fwrite(&v, sizeof(v), 1, f) == 1; }
+static int write_u64(FILE *f, uint64_t v) { return fwrite(&v, sizeof(v), 1, f) == 1; }
+static int write_i32(FILE *f, int32_t v)  { return fwrite(&v, sizeof(v), 1, f) == 1; }
+static int write_f32(FILE *f, float v)    { return fwrite(&v, sizeof(v), 1, f) == 1; }
+static int read_u32(FILE *f, uint32_t *v) { return fread(v, sizeof(*v), 1, f) == 1; }
+static int read_u64(FILE *f, uint64_t *v) { return fread(v, sizeof(*v), 1, f) == 1; }
+static int read_i32(FILE *f, int32_t *v)  { return fread(v, sizeof(*v), 1, f) == 1; }
+static int read_f32(FILE *f, float *v)    { return fread(v, sizeof(*v), 1, f) == 1; }
+
+int leo_save_state(const Leo *leo, const char *path) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return 0;
+
+    /* header */
+    write_u32(f, LEO_STATE_MAGIC);
+    write_u32(f, LEO_STATE_VERSION);
+    write_u64(f, (uint64_t)leo->step);
+    write_u64(f, 0); /* reserved flags */
+
+    /* BPE: merges + vocab */
+    write_i32(f, leo->bpe.n_merges);
+    fwrite(leo->bpe.merges, sizeof(BPEMerge), (size_t)leo->bpe.n_merges, f);
+    write_i32(f, leo->bpe.vocab_size);
+    for (int i = 0; i < leo->bpe.vocab_size; i++) {
+        write_i32(f, leo->bpe.vocab_len[i]);
+        if (leo->bpe.vocab_len[i] > 0)
+            fwrite(leo->bpe.vocab_bytes[i], 1,
+                   (size_t)leo->bpe.vocab_len[i], f);
+    }
+
+    /* CoocField: freq[] + compact entries */
+    write_i32(f, leo->cooc.freq_size);
+    fwrite(leo->cooc.freq, sizeof(float), (size_t)leo->cooc.freq_size, f);
+    write_u64(f, (uint64_t)leo->cooc.total_tokens);
+    /* count live entries first so reader can pre-size */
+    int live = 0;
+    for (int i = 0; i < leo->cooc.capacity; i++)
+        if (leo->cooc.entries[i].count > 0) live++;
+    write_i32(f, live);
+    for (int i = 0; i < leo->cooc.capacity; i++) {
+        if (leo->cooc.entries[i].count <= 0) continue;
+        write_i32(f, leo->cooc.entries[i].src);
+        write_i32(f, leo->cooc.entries[i].dst);
+        write_f32(f, leo->cooc.entries[i].count);
+    }
+
+    /* BigramTable: compact entries */
+    int bi_live = 0;
+    for (int i = 0; i < leo->bigrams.capacity; i++)
+        if (leo->bigrams.entries[i].count > 0) bi_live++;
+    write_i32(f, bi_live);
+    for (int i = 0; i < leo->bigrams.capacity; i++) {
+        if (leo->bigrams.entries[i].count <= 0) continue;
+        write_i32(f, leo->bigrams.entries[i].src);
+        write_i32(f, leo->bigrams.entries[i].dst);
+        write_f32(f, leo->bigrams.entries[i].count);
+    }
+
+    /* TrigramTable: compact entries */
+    int tri_live = 0;
+    for (int i = 0; i < leo->trigrams.capacity; i++)
+        if (leo->trigrams.entries[i].count > 0) tri_live++;
+    write_i32(f, tri_live);
+    for (int i = 0; i < leo->trigrams.capacity; i++) {
+        if (leo->trigrams.entries[i].count <= 0) continue;
+        write_i32(f, leo->trigrams.entries[i].a);
+        write_i32(f, leo->trigrams.entries[i].b);
+        write_i32(f, leo->trigrams.entries[i].c);
+        write_f32(f, leo->trigrams.entries[i].count);
+    }
+
+    /* LeoField — scalars, chambers, prophecies, scars */
+    const LeoField *fld = &leo->field;
+    write_f32(f, fld->pain);
+    write_f32(f, fld->tension);
+    write_f32(f, fld->debt);
+    write_f32(f, fld->dissonance);
+    write_f32(f, fld->trauma);
+    write_i32(f, fld->velocity_mode);
+    write_f32(f, fld->velocity_mag);
+    fwrite(fld->chamber_act, sizeof(float), LEO_N_CHAMBERS, f);
+    fwrite(fld->chamber_ext, sizeof(float), LEO_N_CHAMBERS, f);
+    fwrite(fld->retention_state, sizeof(float), LEO_RET_DIM, f);
+    write_i32(f, fld->n_prophecy);
+    fwrite(fld->prophecy, sizeof(LeoProphecy), LEO_PROPHECY_MAX, f);
+    write_i32(f, fld->n_scars);
+    fwrite(fld->scars, LEO_SCAR_BYTES, LEO_SCAR_MAX, f);
+
+    /* bootstrap ids */
+    write_i32(f, fld->n_bootstrap);
+    if (fld->n_bootstrap > 0 && fld->bootstrap_ids)
+        fwrite(fld->bootstrap_ids, sizeof(int), (size_t)fld->n_bootstrap, f);
+
+    /* destiny_bag (variable size) */
+    write_i32(f, fld->destiny_cap);
+    if (fld->destiny_cap > 0 && fld->destiny_bag)
+        fwrite(fld->destiny_bag, sizeof(float), (size_t)fld->destiny_cap, f);
+
+    /* w_embed — persistent per-token fingerprints. Saved so retention
+     * state keeps meaning across restarts (same ids carry same vectors). */
+    write_i32(f, fld->w_embed_cap);
+    if (fld->w_embed_cap > 0 && fld->w_embed)
+        fwrite(fld->w_embed, sizeof(float),
+               (size_t)fld->w_embed_cap * LEO_RET_DIM, f);
+
+    fclose(f);
+    return 1;
+}
+
+int leo_load_state(Leo *leo, const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    uint32_t magic = 0, version = 0;
+    uint64_t step = 0, flags = 0;
+    if (!read_u32(f, &magic) || magic != LEO_STATE_MAGIC) { fclose(f); return 0; }
+    if (!read_u32(f, &version) || version != LEO_STATE_VERSION) { fclose(f); return 0; }
+    if (!read_u64(f, &step))  { fclose(f); return 0; }
+    if (!read_u64(f, &flags)) { fclose(f); return 0; }
+
+    /* Start from a fresh init so all buffers exist at the right size. */
+    leo_free(leo);
+    leo_init(leo);
+    leo->step = (long)step;
+
+    /* BPE */
+    int32_t n_merges = 0, vocab_size = 0;
+    read_i32(f, &n_merges);
+    leo->bpe.n_merges = n_merges;
+    fread(leo->bpe.merges, sizeof(BPEMerge), (size_t)n_merges, f);
+    read_i32(f, &vocab_size);
+    leo->bpe.vocab_size = vocab_size;
+    for (int i = 0; i < vocab_size; i++) {
+        int32_t vlen = 0;
+        read_i32(f, &vlen);
+        leo->bpe.vocab_len[i] = vlen;
+        if (vlen > 0) fread(leo->bpe.vocab_bytes[i], 1, (size_t)vlen, f);
+    }
+    /* pair_* hash stays zeroed from leo_init — it only matters during
+     * ingest, and any new ingest will repopulate it. */
+
+    /* Cooc freq */
+    int32_t freq_size = 0;
+    read_i32(f, &freq_size);
+    if (freq_size == leo->cooc.freq_size)
+        fread(leo->cooc.freq, sizeof(float), (size_t)freq_size, f);
+    else { fclose(f); return 0; }
+    uint64_t total = 0;
+    read_u64(f, &total);
+    leo->cooc.total_tokens = (long)total;
+    int32_t cooc_live = 0;
+    read_i32(f, &cooc_live);
+    for (int i = 0; i < cooc_live; i++) {
+        int32_t src, dst; float c;
+        read_i32(f, &src); read_i32(f, &dst); read_f32(f, &c);
+        cooc_update(&leo->cooc, src, dst, c);
+    }
+
+    /* Bigrams */
+    int32_t bi_live = 0;
+    read_i32(f, &bi_live);
+    for (int i = 0; i < bi_live; i++) {
+        int32_t src, dst; float c;
+        read_i32(f, &src); read_i32(f, &dst); read_f32(f, &c);
+        bigram_update(&leo->bigrams, src, dst, c);
+    }
+
+    /* Trigrams */
+    int32_t tri_live = 0;
+    read_i32(f, &tri_live);
+    for (int i = 0; i < tri_live; i++) {
+        int32_t a, b, c; float cnt;
+        read_i32(f, &a); read_i32(f, &b); read_i32(f, &c); read_f32(f, &cnt);
+        trigram_update(&leo->trigrams, a, b, c, cnt);
+    }
+
+    /* Field scalars */
+    LeoField *fld = &leo->field;
+    read_f32(f, &fld->pain);
+    read_f32(f, &fld->tension);
+    read_f32(f, &fld->debt);
+    read_f32(f, &fld->dissonance);
+    read_f32(f, &fld->trauma);
+    read_i32(f, &fld->velocity_mode);
+    read_f32(f, &fld->velocity_mag);
+    fread(fld->chamber_act, sizeof(float), LEO_N_CHAMBERS, f);
+    fread(fld->chamber_ext, sizeof(float), LEO_N_CHAMBERS, f);
+    fread(fld->retention_state, sizeof(float), LEO_RET_DIM, f);
+    read_i32(f, &fld->n_prophecy);
+    fread(fld->prophecy, sizeof(LeoProphecy), LEO_PROPHECY_MAX, f);
+    read_i32(f, &fld->n_scars);
+    fread(fld->scars, LEO_SCAR_BYTES, LEO_SCAR_MAX, f);
+
+    /* bootstrap ids */
+    int32_t n_boot = 0;
+    read_i32(f, &n_boot);
+    if (n_boot > 0) {
+        free(fld->bootstrap_ids);
+        fld->bootstrap_ids = malloc((size_t)n_boot * sizeof(int));
+        fread(fld->bootstrap_ids, sizeof(int), (size_t)n_boot, f);
+        fld->n_bootstrap = n_boot;
+    }
+
+    /* destiny_bag */
+    int32_t dst_cap = 0;
+    read_i32(f, &dst_cap);
+    if (dst_cap == fld->destiny_cap)
+        fread(fld->destiny_bag, sizeof(float), (size_t)dst_cap, f);
+    else { fclose(f); return 0; }
+
+    /* w_embed */
+    int32_t wec = 0;
+    read_i32(f, &wec);
+    if (wec == fld->w_embed_cap && fld->w_embed)
+        fread(fld->w_embed, sizeof(float),
+              (size_t)wec * LEO_RET_DIM, f);
+    else { fclose(f); return 0; }
+
+    fclose(f);
+    return 1;
+}
+
 /* Ingest a block of human text. This is how Leo hears. */
 void leo_ingest(Leo *leo, const char *text) {
     if (!text || !*text) return;
@@ -2523,7 +2767,9 @@ static void usage(const char *prog) {
         "usage: %s [corpus.txt] [options]\n"
         "  --prompt \"text\"   respond to one prompt and exit\n"
         "  --repl            read prompts from stdin until 'quit'\n"
-        "  --demo            default — five isolated sentences + one chain\n",
+        "  --demo            default — five isolated sentences + one chain\n"
+        "  --state PATH      state file (default: leo.state)\n"
+        "  --fresh           ignore existing state and ingest from scratch\n",
         prog);
 }
 
@@ -2532,9 +2778,11 @@ int main(int argc, char **argv) {
            "post-transformer. byte-level BPE. zero weights.\n\n");
 
     const char *corpus = "leo.txt";
+    const char *state_path = "leo.state";
     const char *one_prompt = NULL;
     int mode_repl = 0;
     int mode_demo = 1;
+    int mode_fresh = 0;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--prompt") && i + 1 < argc) {
@@ -2545,6 +2793,10 @@ int main(int argc, char **argv) {
             mode_demo = 0;
         } else if (!strcmp(argv[i], "--demo")) {
             mode_demo = 1;
+        } else if (!strcmp(argv[i], "--state") && i + 1 < argc) {
+            state_path = argv[++i];
+        } else if (!strcmp(argv[i], "--fresh")) {
+            mode_fresh = 1;
         } else if (argv[i][0] != '-') {
             corpus = argv[i];
         } else {
@@ -2556,34 +2808,49 @@ int main(int argc, char **argv) {
     Leo leo;
     leo_init(&leo);
 
-    FILE *f = fopen(corpus, "rb");
-    if (f) {
-        fseek(f, 0, SEEK_END); long sz = ftell(f); rewind(f);
-        char *buf = malloc(sz + 1);
-        if (fread(buf, 1, sz, f) != (size_t)sz) {
-            fprintf(stderr, "read error\n"); return 1;
+    /* Try to resume from persisted state first. Leo grows across
+     * sessions — every conversation adds to his field. Only fall back
+     * to a fresh ingest if the state file is absent or if the user
+     * explicitly asked for --fresh. */
+    int resumed = 0;
+    if (!mode_fresh) {
+        if (leo_load_state(&leo, state_path)) {
+            fprintf(stderr, "[resume] %s — step=%ld vocab=%d\n",
+                    state_path, leo.step, leo.bpe.vocab_size);
+            resumed = 1;
         }
-        buf[sz] = 0;
-        fclose(f);
-        fprintf(stderr, "[ingest] %s — %ld bytes\n", corpus, sz);
-        leo_ingest(&leo, buf);
-        free(buf);
-    } else {
-        /* No external corpus — Leo starts from his embedded origin.
-         * He can still hear and speak, his field is just smaller. */
-        fprintf(stderr, "[ingest] (no %s — falling back to embedded bootstrap)\n",
-                corpus);
-        leo_ingest(&leo, LEO_EMBEDDED_BOOTSTRAP);
     }
 
-    /* anchor the origin — trauma will pull toward these when pain rises. */
-    {
-        int boot_ids[1024];
-        int boot_n = bpe_encode(&leo.bpe,
-                                (const uint8_t *)LEO_EMBEDDED_BOOTSTRAP,
-                                (int)strlen(LEO_EMBEDDED_BOOTSTRAP),
-                                boot_ids, 1024);
-        leo_field_set_bootstrap(&leo.field, boot_ids, boot_n);
+    if (!resumed) {
+        FILE *f = fopen(corpus, "rb");
+        if (f) {
+            fseek(f, 0, SEEK_END); long sz = ftell(f); rewind(f);
+            char *buf = malloc(sz + 1);
+            if (fread(buf, 1, sz, f) != (size_t)sz) {
+                fprintf(stderr, "read error\n"); return 1;
+            }
+            buf[sz] = 0;
+            fclose(f);
+            fprintf(stderr, "[ingest] %s — %ld bytes\n", corpus, sz);
+            leo_ingest(&leo, buf);
+            free(buf);
+        } else {
+            /* No external corpus — Leo starts from his embedded origin.
+             * He can still hear and speak, his field is just smaller. */
+            fprintf(stderr, "[ingest] (no %s — falling back to embedded bootstrap)\n",
+                    corpus);
+            leo_ingest(&leo, LEO_EMBEDDED_BOOTSTRAP);
+        }
+
+        /* anchor the origin — trauma will pull toward these when pain rises. */
+        {
+            int boot_ids[1024];
+            int boot_n = bpe_encode(&leo.bpe,
+                                    (const uint8_t *)LEO_EMBEDDED_BOOTSTRAP,
+                                    (int)strlen(LEO_EMBEDDED_BOOTSTRAP),
+                                    boot_ids, 1024);
+            leo_field_set_bootstrap(&leo.field, boot_ids, boot_n);
+        }
     }
 
     if (one_prompt) {
@@ -2604,6 +2871,15 @@ int main(int argc, char **argv) {
                 line[--n] = 0;
             if (!line[0]) continue;
             if (!strcmp(line, "quit") || !strcmp(line, "exit")) break;
+            if (!strcmp(line, "/save")) {
+                if (leo_save_state(&leo, state_path))
+                    fprintf(stderr, "[save] %s — step=%ld vocab=%d\n",
+                            state_path, leo.step, leo.bpe.vocab_size);
+                else
+                    fprintf(stderr, "[save] FAILED: %s\n", state_path);
+                fflush(stderr);
+                continue;
+            }
             if (!strcmp(line, "/stats")) {
                 printf("[stats] vocab=%d(+%d)  bigrams=%d(+%d)  "
                        "trigrams=%d(+%d)  cooc=%d(+%d)  step=%ld  "
@@ -2649,6 +2925,12 @@ int main(int argc, char **argv) {
         leo_chain(&leo, 8, chain, sizeof(chain));
         printf("  %s\n", chain);
     }
+
+    /* persist before exit — Leo grows across sessions. Saving after
+     * --demo too, so the organism carries what it just heard. */
+    if (leo_save_state(&leo, state_path))
+        fprintf(stderr, "[save] %s — step=%ld vocab=%d\n",
+                state_path, leo.step, leo.bpe.vocab_size);
 
     leo_free(&leo);
     return 0;
