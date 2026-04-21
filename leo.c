@@ -32,10 +32,6 @@ static const char *LEO_EMBEDDED_BOOTSTRAP =
     "\n"
     "LEO is a language engine organism.\n"
     "\n"
-    "No weights.\n"
-    "No datasets.\n"
-    "No internet.\n"
-    "\n"
     "Only a small internal seed and whatever you say to it. Pure recursion. Resonant essence.\n"
     "\n"
     "Leo listens to you. He records. He builds trigrams.\n"
@@ -70,7 +66,7 @@ static const char *LEO_EMBEDDED_BOOTSTRAP =
 #define LEO_BIGRAM_MAX    (128 * 1024)
 #define LEO_TRIGRAM_MAX   (256 * 1024)
 #define LEO_PAIR_HASH     (64 * 1024)
-#define LEO_MERGE_THRESH  4
+#define LEO_MERGE_THRESH  2  /* online BPE: promote pairs seen ≥2× — aggressive learning from live chat */
 #define LEO_TRI_IDX_MAX   (256 * 1024) /* (a,b) → {c,count} reverse index */
 #define LEO_BI_IDX_MAX    (128 * 1024) /* src → {dst,count} reverse index */
 #define LEO_BEST_OF_K     3
@@ -1716,6 +1712,16 @@ int leo_step_token(const Leo *leo, int prev2, int prev1, float temp) {
          * (e.g. "whi" + choose_start "It" → "whiIt"). */
         if (prev_ends_alpha) return 32; /* ASCII ' ' */
         return leo_choose_start(leo);
+    }
+
+    /* anti-chain guard: if we literally just emitted a pure-space token
+     * after some prev2 (typical fallback recovery: alpha → space → ...),
+     * do not pick prev2 again — otherwise we loop "a <space> a <space> a".
+     * Zero the score so weighted_sample picks anything else; if *every*
+     * candidate ends up zero, sample falls back to uniform random. */
+    if (prev1 == 32 && prev2 >= 0) {
+        for (int i = 0; i < cc.n; i++)
+            if (cand_id[i] == prev2) cand_sc[i] = 0.0f;
     }
 
     for (int i = 0; i < cc.n; i++)
