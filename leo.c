@@ -1779,20 +1779,45 @@ int leo_step_token(const Leo *leo, int prev2, int prev1, float temp) {
      * the sentence is over: emit '.' to close cleanly instead of
      * letting weighted_sample fall back to uniform over the blocked
      * set and reopen the chain. */
-    if (prev1 == 32 && prev2 >= 0) {
-        int prev2_is_short_wl =
-            is_standalone_whitelist_word(&leo->bpe, prev2);
+    /* Detect "prev ended on a word boundary AND prev was itself a
+     * standalone whitelist word". Two forms count as such a boundary:
+     *   (a) prev1 is literally the space byte (id == 32) after a
+     *       fallback recovery — prev2 carries the word;
+     *   (b) prev1 is a multi-byte token whose stripped content is a
+     *       whitelist-short word and whose last byte is whitespace,
+     *       e.g. " of ", " the ", " to " — these are word+space in
+     *       a single token. In that case prev1 *itself* is the short
+     *       standalone word.
+     * Either form, if we let the next emit be another whitelist-short
+     * word with no leading space, we open "of o remember" / "the a
+     * book" style chains. Zero those candidates. If every candidate
+     * ends up zero, return -1 to end the sentence cleanly. */
+    int chain_guard_short = -1;   /* the token id we treat as "the short word" */
+    if (prev1 == 32 && prev2 >= 0 &&
+        is_standalone_whitelist_word(&leo->bpe, prev2)) {
+        chain_guard_short = prev2;
+    } else if (prev1 >= 0) {
+        int plast = bpe_token_last_byte(&leo->bpe, prev1);
+        int prev_ends_space = (plast == ' ' || plast == '\n' ||
+                               plast == '\r' || plast == '\t');
+        if (prev_ends_space &&
+            is_standalone_whitelist_word(&leo->bpe, prev1)) {
+            chain_guard_short = prev1;
+        }
+    }
+    if (chain_guard_short >= 0 || (prev1 == 32 && prev2 >= 0)) {
         int any_nonzero = 0;
         for (int i = 0; i < cc.n; i++) {
-            if (cand_id[i] == prev2) { cand_sc[i] = 0.0f; continue; }
-            if (prev2_is_short_wl &&
+            if (prev1 == 32 && cand_id[i] == prev2) {
+                cand_sc[i] = 0.0f; continue;
+            }
+            if (chain_guard_short >= 0 &&
                 is_standalone_whitelist_word(&leo->bpe, cand_id[i])) {
-                cand_sc[i] = 0.0f;
-                continue;
+                cand_sc[i] = 0.0f; continue;
             }
             if (cand_sc[i] > 0) any_nonzero = 1;
         }
-        if (!any_nonzero) return -1; /* no legit continuation → end sentence */
+        if (!any_nonzero) return -1;
     }
 
     for (int i = 0; i < cc.n; i++)
