@@ -1504,6 +1504,12 @@ static double leo_profile_bigram_ns = 0;
 static double leo_profile_trigram_ns = 0;
 static double leo_profile_cooc_ns = 0;
 static double leo_profile_merge_ns = 0;
+static double leo_profile_step_ns = 0;
+static double leo_profile_step_n  = 0;
+static double leo_profile_powf_ns = 0;
+static double leo_profile_self_voice_ns = 0;
+static double leo_profile_field_step_ns = 0;
+static double leo_profile_cand_collect_ns = 0;
 
 /* Ingest a block of human text. This is how Leo hears. */
 void leo_ingest(Leo *leo, const char *text) {
@@ -1584,6 +1590,14 @@ void leo_profile_report(FILE *f) {
             leo_profile_trigram_ns/1e6,
             leo_profile_cooc_ns/1e6,
             leo_profile_merge_ns/1e6);
+    fprintf(f, "[profile] step_total=%.1fms step_n=%.0f step_avg=%.2fus powf=%.1fms\n",
+            leo_profile_step_ns/1e6,
+            leo_profile_step_n,
+            leo_profile_step_n > 0 ? leo_profile_step_ns/1e3/leo_profile_step_n : 0.0,
+            leo_profile_powf_ns/1e6);
+    fprintf(f, "[profile] self_voice=%.1fms field_step=%.1fms\n",
+            leo_profile_self_voice_ns/1e6,
+            leo_profile_field_step_ns/1e6);
 }
 
 /* ========================================================================
@@ -2073,6 +2087,7 @@ static int cand_collect_bi(int dst, float count, void *ud) {
 }
 
 int leo_step_token(const Leo *leo, int prev2, int prev1, float temp) {
+    double _t0 = leo_ns();
     if (prev1 < 0) return leo_choose_start(leo);
     temp = clampf(temp, 0.05f, 10.0f);
     float inv_temp = 1.0f / temp;
@@ -2149,10 +2164,14 @@ int leo_step_token(const Leo *leo, int prev2, int prev1, float temp) {
         if (!any_nonzero) return -1;
     }
 
+    double _tp0 = leo_ns();
     for (int i = 0; i < cc.n; i++)
         cand_sc[i] = powf(cand_sc[i], inv_temp);
+    leo_profile_powf_ns += leo_ns() - _tp0;
 
     int pick = weighted_sample(cand_sc, cc.n);
+    leo_profile_step_ns += leo_ns() - _t0;
+    leo_profile_step_n  += 1.0;
     return pick < 0 ? -1 : cand_id[pick];
 }
 
@@ -2214,9 +2233,13 @@ int leo_generate_ex(Leo *leo, char *out, int max_len,
         /* field evolves once per emitted token; coherence_hint uses
          * a simple proxy (did we find any trigram/bigram candidate?) —
          * when prev1 has no successors, pain grows toward bootstrap. */
+        double _tf = leo_ns();
         leo_field_step(&leo->field, nxt, nxt >= 0 ? 1.0f : 0.0f);
+        leo_profile_field_step_ns += leo_ns() - _tf;
         /* body hears its own voice — anchor tokens nudge chambers */
+        double _tv = leo_ns();
         leo_field_self_voice(&leo->field, &leo->bpe, nxt);
+        leo_profile_self_voice_ns += leo_ns() - _tv;
 
         /* light repetition guard: kill immediate and back-to-back repeats */
         if (nxt == prev1) continue;
