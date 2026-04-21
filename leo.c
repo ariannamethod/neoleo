@@ -1258,12 +1258,25 @@ void leo_ingest(Leo *leo, const char *text) {
 
 /* a token is a clean start candidate if it begins with space or an
  * uppercase letter — mid-word BPE fragments are rejected */
+/* Forward decl — is_orphan_fragment is defined later (after
+ * is_common_short_word). is_clean_seed_token now needs it so that
+ * seed tokens like " aiat" (clean leading-space + 4-char orphan body)
+ * are rejected at the seed stage — otherwise they bypass
+ * cand_collect_* which is the only other orphan filter. */
+static int is_orphan_fragment(const BPE *bpe, int id);
+
 static int is_clean_seed_token(const BPE *bpe, int id) {
     if (id < 0 || id >= bpe->vocab_size || bpe->vocab_len[id] == 0) return 0;
     uint8_t c = bpe->vocab_bytes[id][0];
-    if (c == ' ' || c == '\n' || c == '\t') return 1;
-    if (c >= 'A' && c <= 'Z') return 1;
-    return 0;
+    if (!(c == ' ' || c == '\n' || c == '\t' || (c >= 'A' && c <= 'Z')))
+        return 0;
+    /* A "clean" first byte is necessary but not sufficient: reject seeds
+     * whose stripped content is still an orphan fragment (" aiat",
+     * " ome", " ight"). Without this, these slip into sentences as
+     * start tokens via choose_start / choose_continuation, bypassing
+     * the orphan gate that lives in the candidate collector. */
+    if (is_orphan_fragment(bpe, id)) return 0;
+    return 1;
 }
 
 /* sentence boundary: token contains .!? followed by space/newline/EOS */
@@ -1406,13 +1419,14 @@ static float leo_field_temperature_mult(const LeoField *f);
 static void  leo_field_step(LeoField *f, int emitted, float coherence_hint);
 
 /* small byte helpers for the word-completion gate */
-/* Common short alpha words (≤3 chars) that are legitimately whole words.
- * Anything else short + alpha-only is almost certainly a BPE fragment
- * masquerading as a standalone word between space and punctuation. */
+/* Common short alpha words (≤4 chars) that are legitimately whole words
+ * in a child-voice vocabulary. Anything else short + alpha-only is a
+ * BPE fragment masquerading as a standalone word between space and
+ * punctuation ("aiat", "aime", "ome", "ight", "abou", "kne", "goo"). */
 static int is_common_short_word(const uint8_t *bytes, int start, int end) {
     int len = end - start;
-    if (len < 1 || len > 3) return 0;
-    char low[4] = {0};
+    if (len < 1 || len > 4) return 0;
+    char low[6] = {0};
     for (int i = 0; i < len; i++) {
         uint8_t c = bytes[start + i];
         if (c >= 'A' && c <= 'Z') c = (uint8_t)(c - 'A' + 'a');
@@ -1420,13 +1434,44 @@ static int is_common_short_word(const uint8_t *bytes, int start, int end) {
     }
     low[len] = 0;
     static const char *wl[] = {
+        /* 1-char */
         "a","i","o",
+        /* 2-char */
         "ah","oh","hi","no","so","is","it","an","at","be","by","do","go",
         "he","if","in","me","my","of","on","or","to","up","us","we","am",
-        "us","as","ok","yo",
+        "as","ok","yo",
+        /* 3-char — function / deixis / verbs */
         "the","and","but","you","she","her","his","its","all","how","who",
         "why","our","out","ago","any","let","now","day","one","two","six",
-        "ten","new","old","yes","far","saw","got","gee","oh ",
+        "ten","new","old","yes","far","saw","got","gee","had","has","him",
+        /* Leo's own name — whitelist the organism's identity. Without
+         * this, 3-char "Leo" is marked orphan and rejected as seed. */
+        "leo",
+        "was","not","for","off","own","too","may","way","say","see","ask",
+        "add","put","get","got","run","sat","sit","yet","yep","mom","dad",
+        /* 3-char — body / room / sky / child nouns */
+        "boy","bad","big","red","sun","cat","dog","bed","hot","eye","ear",
+        "arm","leg","toe","lip","sky","sea","car","top","end","men","fun",
+        "tea","ice","pie","egg","nut","bow","box","hug","toy","pen","cup",
+        /* 4-char — function words / verbs */
+        "that","this","with","from","have","been","were","will","also",
+        "when","what","then","than","each","most","many","some","such",
+        "they","them","your","into","onto","upon","here","near","over",
+        "down","back","away","ever","just","only","said","told","tell",
+        "made","much","open","last","kind","like","take","took","came",
+        "come","done","even","gone","kept","felt","gave","turn","stop",
+        "mean","want","knew","know","look","walk","wait","hear","feel",
+        "help","hold","read","sing","sang","play","rest","wake","wash",
+        "hope","hurt","miss","need","seem","show","stay","talk","meet",
+        "call","pick","left","next","good","long","full","high","deep",
+        "dark","soft","warm","cold","wide","slow","real","true",
+        /* 4-char — concrete child nouns */
+        "time","home","door","room","hand","love","life","rain","wind",
+        "tree","nose","step","arms","legs","eyes","face","baby","book",
+        "boys","girl","word","year","hair","head","skin","leaf","milk",
+        "food","nest","pine","fire","lake","road","moon","star","snow",
+        "rose","bird","wing","bell","bath","soup","cake","toys","shoe",
+        "boot","rock","sand","shed","seed","yarn",
         NULL
     };
     for (int i = 0; wl[i]; i++) if (!strcmp(low, wl[i])) return 1;
@@ -1434,18 +1479,34 @@ static int is_common_short_word(const uint8_t *bytes, int start, int end) {
 }
 
 /* A token is an "orphan fragment" if its decoded content (ignoring any
- * leading/trailing whitespace) is pure letters, length 1 or 2, and not
- * in the common-short-word whitelist. Examples: "m", "s", " p", "wo ".
- * Examples that pass: " a", "I", "the", "Leo" (length 3 not flagged),
- * " hi", " no". Worth rejecting even when prev is a clean space — we
- * just don't want Leo emitting "m" as a standalone word. */
+ * leading/trailing whitespace) is pure letters, length 1 to 4, and NOT
+ * in the common-short-word whitelist. Examples rejected: "m", "s",
+ * " p", "wo ", "ome", "ime", "ight", "aime", "aiat", "aion", "abou".
+ * Examples that pass: " a", "I", "the", "Leo" (length 3 but real
+ * word via whitelist), " hi", " no", "door", "home", "baby". Five
+ * letters and above always pass — real words dominate that range in
+ * child-voice corpora. */
 static int is_orphan_fragment(const BPE *bpe, int id) {
     if (id < 0 || id >= bpe->vocab_size) return 0;
     int len = bpe->vocab_len[id];
     if (len == 0) return 0;
     const uint8_t *b = bpe->vocab_bytes[id];
     int s = 0, e = len;
+    /* strip outer whitespace */
     while (s < e && (b[s] == ' ' || b[s] == '\n' || b[s] == '\r' || b[s] == '\t')) s++;
+    while (e > s && (b[e-1] == ' ' || b[e-1] == '\n' || b[e-1] == '\r' || b[e-1] == '\t')) e--;
+    if (s == e) return 0;
+    /* Strip trailing sentence punctuation / common separators too. A BPE
+     * merge like " ome." / " ime," / " aion." ends in punctuation yet
+     * the user-visible word is still the alpha prefix. Without this
+     * strip such tokens sneak past the gate (the punct makes the loop
+     * below see a non-alpha char and return early) and then cleanup in
+     * leo_generate_ex truncates at that dot, leaving the raw fragment
+     * as a standalone word. */
+    while (e > s && (b[e-1] == '.' || b[e-1] == ',' || b[e-1] == '!' ||
+                     b[e-1] == '?' || b[e-1] == ';' || b[e-1] == ':')) e--;
+    /* strip any whitespace that was between the alpha body and the
+     * trailing punct (rare, but possible for merges like " ome ,") */
     while (e > s && (b[e-1] == ' ' || b[e-1] == '\n' || b[e-1] == '\r' || b[e-1] == '\t')) e--;
     if (s == e) return 0;
     for (int i = s; i < e; i++) {
@@ -1453,7 +1514,7 @@ static int is_orphan_fragment(const BPE *bpe, int id) {
         if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) return 0;
     }
     int clen = e - s;
-    if (clen >= 3) return 0;                              /* long enough */
+    if (clen >= 5) return 0;                              /* long enough */
     if (is_common_short_word(b, s, e)) return 0;          /* real short word */
     return 1;
 }
@@ -1526,15 +1587,51 @@ static float word_gate_penalty(const CandCollector2 *cc, int cand_id) {
     return 0.02f; /* orphan: crush 50× so continuation reliably wins */
 }
 
-/* Hard exclusion for the candidate collector. Uppercase-alpha after an
- * alpha-ended token is cross-sentence token-glue ("cataloHe", "whiShe").
- * Multiplicative penalty alone can be overpowered by very large base
- * cooc/bigram counts; skipping the candidate outright ensures no
- * temperature schedule or field bias can resurrect it. */
+/* Hard exclusion for the candidate collector. After an alpha-ended
+ * previous token, two classes of candidate are glue, not continuation:
+ *
+ *   1. Capital-alpha start ("cataloHe", "whiShe") — cross-sentence
+ *      token slammed onto the alpha tail.
+ *
+ *   2. Lowercase standalone short-word ("a"→"i"→"on" concatenating
+ *      into "aion"). Each of "a", "i", "on" is a legitimate whole
+ *      word on its own (whitelisted), but when emitted mid-word with
+ *      no leading whitespace they concatenate into nonsense fragments
+ *      in the output buffer. A true word continuation in BPE is a
+ *      suffix fragment NOT in the whitelist ("ty" after "emp" → "empty").
+ *
+ * The multiplicative penalty alone can be overpowered by very large
+ * cooc/bigram priors; skipping outright ensures no temperature or
+ * field bias can bring these candidates back. */
+static int is_standalone_whitelist_word(const BPE *bpe, int cand_id) {
+    int len = bpe->vocab_len[cand_id];
+    const uint8_t *b = bpe->vocab_bytes[cand_id];
+    int s = 0, e = len;
+    while (s < e && (b[s] == ' ' || b[s] == '\n' || b[s] == '\r' || b[s] == '\t')) s++;
+    while (e > s && (b[e-1] == ' ' || b[e-1] == '\n' || b[e-1] == '\r' || b[e-1] == '\t')) e--;
+    while (e > s && (b[e-1] == '.' || b[e-1] == ',' || b[e-1] == '!' ||
+                     b[e-1] == '?' || b[e-1] == ';' || b[e-1] == ':')) e--;
+    while (e > s && (b[e-1] == ' ' || b[e-1] == '\n' || b[e-1] == '\r' || b[e-1] == '\t')) e--;
+    if (s == e) return 0;
+    for (int i = s; i < e; i++) {
+        uint8_t c = b[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) return 0;
+    }
+    return is_common_short_word(b, s, e);
+}
+
 static int is_capital_glue_cand(const CandCollector2 *cc, int cand_id) {
     if (!cc->bpe || !cc->prev_ends_alpha) return 0;
     int first = bpe_token_first_byte(cc->bpe, cand_id);
-    return first >= 'A' && first <= 'Z';
+    /* Class 1: uppercase-alpha after alpha tail. */
+    if (first >= 'A' && first <= 'Z') return 1;
+    /* Class 2: lowercase-alpha start AND the whole token is a whitelisted
+     * standalone word (no leading space in its bytes, so it concatenates
+     * directly onto the alpha tail in the output buffer). */
+    if (first >= 'a' && first <= 'z' &&
+        is_standalone_whitelist_word(cc->bpe, cand_id))
+        return 1;
+    return 0;
 }
 
 static int cand_collect_tri(int c, float count, void *ud) {

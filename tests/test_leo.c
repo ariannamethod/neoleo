@@ -460,6 +460,131 @@ static void test_is_orphan_fragment_detects_shorts(void) {
     PASS();
 }
 
+/* Helper: forge a virtual BPE token that holds the given alpha bytes.
+ * We write directly into the vocab slot following the 256 byte ids so
+ * tests can probe is_orphan_fragment on multi-byte strings without
+ * driving a full ingest. */
+static int forge_alpha_token(BPE *bpe, const char *s) {
+    int id = bpe->vocab_size;
+    int n  = (int)strlen(s);
+    if (n > LEO_MAX_TOKEN_LEN) n = LEO_MAX_TOKEN_LEN;
+    memcpy(bpe->vocab_bytes[id], s, (size_t)n);
+    bpe->vocab_len[id] = n;
+    bpe->vocab_size++;
+    return id;
+}
+
+static void test_orphan_gate_rejects_3_and_4_char_fragments(void) {
+    TEST("is_orphan_fragment: 3- and 4-char alpha fragments rejected");
+    BPE bpe;
+    bpe_init(&bpe);
+    /* 3-char fragments that pollute child-voice speech */
+    int ome  = forge_alpha_token(&bpe, "ome");
+    int ime  = forge_alpha_token(&bpe, "ime");
+    int kne  = forge_alpha_token(&bpe, "kne");
+    int goo  = forge_alpha_token(&bpe, "goo");
+    ASSERT(is_orphan_fragment(&bpe, ome) == 1, "'ome' orphan (3-char)");
+    ASSERT(is_orphan_fragment(&bpe, ime) == 1, "'ime' orphan (3-char)");
+    ASSERT(is_orphan_fragment(&bpe, kne) == 1, "'kne' orphan (3-char)");
+    ASSERT(is_orphan_fragment(&bpe, goo) == 1, "'goo' orphan (3-char)");
+    /* 4-char fragments */
+    int aime = forge_alpha_token(&bpe, "aime");
+    int aiat = forge_alpha_token(&bpe, "aiat");
+    int aion = forge_alpha_token(&bpe, "aion");
+    int ight = forge_alpha_token(&bpe, "ight");
+    int abou = forge_alpha_token(&bpe, "abou");
+    ASSERT(is_orphan_fragment(&bpe, aime) == 1, "'aime' orphan (4-char)");
+    ASSERT(is_orphan_fragment(&bpe, aiat) == 1, "'aiat' orphan (4-char)");
+    ASSERT(is_orphan_fragment(&bpe, aion) == 1, "'aion' orphan (4-char)");
+    ASSERT(is_orphan_fragment(&bpe, ight) == 1, "'ight' orphan (4-char)");
+    ASSERT(is_orphan_fragment(&bpe, abou) == 1, "'abou' orphan (4-char)");
+    PASS();
+}
+
+static void test_orphan_gate_keeps_real_short_words(void) {
+    TEST("is_orphan_fragment: real 3/4-char words pass whitelist");
+    BPE bpe;
+    bpe_init(&bpe);
+    const char *real3[] = {"the","and","but","you","she","her","his","now",
+                           "day","one","two","had","has","him","was","not",
+                           "for","boy","big","sun","cat","dog",NULL};
+    const char *real4[] = {"that","this","with","from","have","been","were",
+                           "will","when","what","time","home","door","room",
+                           "hand","love","life","rain","tree","nose","eyes",
+                           "face","baby","book","milk","food","moon","star",
+                           NULL};
+    for (int i = 0; real3[i]; i++) {
+        int id = forge_alpha_token(&bpe, real3[i]);
+        ASSERT(is_orphan_fragment(&bpe, id) == 0, real3[i]);
+    }
+    for (int i = 0; real4[i]; i++) {
+        int id = forge_alpha_token(&bpe, real4[i]);
+        ASSERT(is_orphan_fragment(&bpe, id) == 0, real4[i]);
+    }
+    PASS();
+}
+
+static void test_orphan_gate_passes_5plus_always(void) {
+    TEST("is_orphan_fragment: 5+ char tokens always pass (real words dominate)");
+    BPE bpe;
+    bpe_init(&bpe);
+    int word5 = forge_alpha_token(&bpe, "small");
+    int word6 = forge_alpha_token(&bpe, "window");
+    int word7 = forge_alpha_token(&bpe, "morning");
+    /* Even a fragment-shaped 5+ char string (e.g. "aient") passes the
+     * gate — long enough to be a real word or at least not jarring. */
+    int frag5 = forge_alpha_token(&bpe, "aient");
+    ASSERT(is_orphan_fragment(&bpe, word5) == 0, "'small' passes");
+    ASSERT(is_orphan_fragment(&bpe, word6) == 0, "'window' passes");
+    ASSERT(is_orphan_fragment(&bpe, word7) == 0, "'morning' passes");
+    ASSERT(is_orphan_fragment(&bpe, frag5) == 0, "'aient' (5-char) passes by rule");
+    PASS();
+}
+
+static void test_orphan_gate_keeps_tokens_with_leading_space(void) {
+    TEST("is_orphan_fragment: leading-space tokens use stripped content");
+    BPE bpe;
+    bpe_init(&bpe);
+    int sp_ome = forge_alpha_token(&bpe, " ome");   /* " ome" → strip → "ome" */
+    int sp_the = forge_alpha_token(&bpe, " the");   /* " the" → strip → "the" */
+    ASSERT(is_orphan_fragment(&bpe, sp_ome) == 1, "' ome' stripped is orphan");
+    ASSERT(is_orphan_fragment(&bpe, sp_the) == 0, "' the' stripped is real");
+    PASS();
+}
+
+static void test_orphan_gate_strips_trailing_punctuation(void) {
+    TEST("is_orphan_fragment: trailing punct/comma/dot also stripped before length check");
+    BPE bpe;
+    bpe_init(&bpe);
+    /* These were the bypass tokens found in live speech: BPE merges
+     * where the orphan body sits between leading space and trailing
+     * punctuation, so the alpha-only check used to return false on the
+     * dot and the fragment would slip through. */
+    int bypass[] = {
+        forge_alpha_token(&bpe, " ome."),
+        forge_alpha_token(&bpe, " ime,"),
+        forge_alpha_token(&bpe, " aion."),
+        forge_alpha_token(&bpe, " aime!"),
+        forge_alpha_token(&bpe, " ight?"),
+        forge_alpha_token(&bpe, " abou."),
+        -1
+    };
+    const char *names[] = {
+        " ome.", " ime,", " aion.", " aime!", " ight?", " abou."
+    };
+    for (int i = 0; bypass[i] >= 0; i++)
+        ASSERT(is_orphan_fragment(&bpe, bypass[i]) == 1, names[i]);
+
+    /* Real words with trailing punctuation must still pass. */
+    int real_dot   = forge_alpha_token(&bpe, " the.");
+    int real_comma = forge_alpha_token(&bpe, " home,");
+    int real_bang  = forge_alpha_token(&bpe, " Leo!");
+    ASSERT(is_orphan_fragment(&bpe, real_dot)   == 0, "' the.' real word passes");
+    ASSERT(is_orphan_fragment(&bpe, real_comma) == 0, "' home,' real word passes");
+    ASSERT(is_orphan_fragment(&bpe, real_bang)  == 0, "' Leo!' real word passes");
+    PASS();
+}
+
 /* Helper: find the first BPE token id whose bytes begin with `first`.
  * Used by word-boundary gate tests to drive realistic candidate ids. */
 static int find_token_starting_with(const BPE *bpe, uint8_t first) {
@@ -560,12 +685,53 @@ static void test_capital_glue_hard_excluded_by_collector(void) {
 
     cc.prev_ends_alpha = 1;
     ASSERT(is_capital_glue_cand(&cc, he_id) == 1, "capital after alpha → skip");
-    ASSERT(is_capital_glue_cand(&cc, lc_id) == 0, "lowercase after alpha → keep");
+    ASSERT(is_capital_glue_cand(&cc, lc_id) == 0, "bare 't' (not standalone word) after alpha → keep as continuation");
     ASSERT(is_capital_glue_cand(&cc, sp_id) == 0, "space after alpha → keep");
 
     cc.prev_ends_alpha = 0;
     ASSERT(is_capital_glue_cand(&cc, he_id) == 0, "capital after non-alpha → keep");
 
+    PASS();
+}
+
+static void test_lowercase_standalone_glue_excluded(void) {
+    TEST("is_capital_glue_cand: lowercase standalone-whitelist word after alpha-tail → skip");
+    BPE bpe;
+    bpe_init(&bpe);
+    /* Single-byte whitelist words that glue mid-word: "a","i","o","on",
+     * "in","it" (no leading space in their bytes). */
+    int a_id  = (int)'a';
+    int i_id  = (int)'i';
+    int o_id  = (int)'o';
+    /* Forge multi-byte whitelist words and non-whitelist fragments. */
+    int on_id  = forge_alpha_token(&bpe, "on");     /* whitelist standalone */
+    int in_id  = forge_alpha_token(&bpe, "in");     /* whitelist standalone */
+    int the_id = forge_alpha_token(&bpe, "the");    /* whitelist standalone */
+    int ty_id  = forge_alpha_token(&bpe, "ty");     /* NOT whitelist — legit continuation */
+    int ches_id= forge_alpha_token(&bpe, "ches");   /* NOT whitelist — legit continuation */
+    /* Space-prefixed whitelist tokens should PASS — they carry their own
+     * word boundary in the leading space. */
+    int sp_a_id = forge_alpha_token(&bpe, " a");
+    int sp_the_id = forge_alpha_token(&bpe, " the");
+
+    CandCollector cc = {0};
+    cc.bpe = &bpe;
+    cc.prev_ends_alpha = 1;
+
+    ASSERT(is_capital_glue_cand(&cc, a_id)   == 1, "'a' after alpha → glue");
+    ASSERT(is_capital_glue_cand(&cc, i_id)   == 1, "'i' after alpha → glue");
+    ASSERT(is_capital_glue_cand(&cc, o_id)   == 1, "'o' after alpha → glue");
+    ASSERT(is_capital_glue_cand(&cc, on_id)  == 1, "'on' after alpha → glue");
+    ASSERT(is_capital_glue_cand(&cc, in_id)  == 1, "'in' after alpha → glue");
+    ASSERT(is_capital_glue_cand(&cc, the_id) == 1, "'the' after alpha → glue");
+    ASSERT(is_capital_glue_cand(&cc, ty_id)   == 0, "'ty' after alpha → legitimate suffix");
+    ASSERT(is_capital_glue_cand(&cc, ches_id) == 0, "'ches' after alpha → legitimate suffix");
+    ASSERT(is_capital_glue_cand(&cc, sp_a_id) == 0, "' a' (space-prefix) passes");
+    ASSERT(is_capital_glue_cand(&cc, sp_the_id) == 0, "' the' (space-prefix) passes");
+
+    cc.prev_ends_alpha = 0;
+    ASSERT(is_capital_glue_cand(&cc, a_id)  == 0, "'a' after non-alpha → keep");
+    ASSERT(is_capital_glue_cand(&cc, on_id) == 0, "'on' after non-alpha → keep");
     PASS();
 }
 
@@ -799,16 +965,30 @@ static void test_leo_generate_ex_honors_start_hint(void) {
     TEST("leo_generate_ex: start_hint is used as first token");
     Leo leo;
     leo_init(&leo);
-    leo_ingest(&leo, "Leo watches the rain. Leo listens. He waits.");
+    /* Corpus must be big enough for BPE to merge a non-whitespace
+     * upper-start token like "Leo" or "The" — single-byte uppercase
+     * letters alone are orphan fragments after the gate tightened. */
+    const char *corpus =
+        "Leo watches the rain. Leo listens. He waits. The rain is soft. "
+        "The light comes in yellow. Leo hears it. He thinks the light "
+        "knows. The room is quiet. Leo keeps the stone. He does not ask. "
+        "Leo watches again. The hand is warm. Leo has a gift.";
+    for (int k = 0; k < 4; k++) leo_ingest(&leo, corpus);
     char buf[256];
-    /* pick any clean-seed token from the field */
+    /* Pick a clean-seed token whose first byte is non-whitespace, so the
+     * cleanup pass has a visible first character to match against. A
+     * pure-whitespace seed (id=32) gets stripped from the buffer and
+     * would leave nothing to compare. */
     int hint = -1;
     for (int i = 0; i < leo.cooc.freq_size; i++) {
-        if (leo.cooc.freq[i] > 0 && is_clean_seed_token(&leo.bpe, i)) {
-            hint = i; break;
-        }
+        if (leo.cooc.freq[i] <= 0) continue;
+        if (!is_clean_seed_token(&leo.bpe, i)) continue;
+        uint8_t first = leo.bpe.vocab_bytes[i][0];
+        if (first == ' ' || first == '\n' || first == '\r' || first == '\t')
+            continue;
+        hint = i; break;
     }
-    ASSERT(hint >= 0, "found a clean-seed token");
+    ASSERT(hint >= 0, "found a non-whitespace clean-seed token");
     leo_generate_ex(&leo, buf, sizeof(buf), hint, NULL, 0, NULL, NULL);
     /* first decoded byte of buf should match first byte of hint token */
     char exp[LEO_MAX_TOKEN_LEN + 1];
@@ -1237,12 +1417,18 @@ int main(void) {
     test_weighted_sample_peaked();
     test_leo_choose_start_after_ingest();
     test_is_orphan_fragment_detects_shorts();
+    test_orphan_gate_rejects_3_and_4_char_fragments();
+    test_orphan_gate_keeps_real_short_words();
+    test_orphan_gate_passes_5plus_always();
+    test_orphan_gate_keeps_tokens_with_leading_space();
+    test_orphan_gate_strips_trailing_punctuation();
     test_word_gate_crushes_capital_after_alpha_tail();
     test_word_gate_allows_lowercase_continuation();
     test_word_gate_allows_space_or_punct_close();
     test_word_gate_allows_capital_after_nonalpha();
     test_word_gate_crushes_capital_after_apostrophe();
     test_capital_glue_hard_excluded_by_collector();
+    test_lowercase_standalone_glue_excluded();
     test_leo_step_token_uses_bigram_fallback();
     test_leo_generate_produces_output();
     test_leo_generate_starts_upper_ends_punct();
