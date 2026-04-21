@@ -1098,6 +1098,71 @@ static void test_compute_prompt_gravity_nonempty(void) {
     PASS();
 }
 
+static void test_leo_low_freq_alpha_fragment_skips_unseen_5_8_tokens(void) {
+    TEST("is_low_freq_alpha_fragment: 5-8 char alpha-only with freq<3 → skip");
+    Leo leo;
+    leo_init(&leo);
+    /* tiny corpus where "small" appears many times but "ithout" does not */
+    leo_ingest(&leo,
+        "a small thing. a small day. a small house. a small sound. "
+        "a small star. a small kind. a small moon.");
+    /* forge a fragment token that wasn't in corpus */
+    int ithout = forge_alpha_token(&leo.bpe, "ithout");
+    int imagin = forge_alpha_token(&leo.bpe, "imagin");
+    /* "small" is a real multi-byte merge if BPE learned it; check its id */
+    int sp_small[8];
+    int sp_n = bpe_encode(&leo.bpe, (const uint8_t *)" small",
+                          6, sp_small, 8);
+    ASSERT(sp_n >= 1, "small encoded");
+    /* find the longest token in the encoding (the word token itself) */
+    int small_id = sp_small[0];
+    for (int k = 1; k < sp_n; k++)
+        if (leo.bpe.vocab_len[sp_small[k]] > leo.bpe.vocab_len[small_id])
+            small_id = sp_small[k];
+
+    CandCollector cc = {0};
+    cc.bpe = &leo.bpe;
+    cc.cooc = &leo.cooc;
+
+    ASSERT(is_low_freq_alpha_fragment(&cc, ithout) == 1,
+           "'ithout' (6-char, freq 0) → fragment");
+    ASSERT(is_low_freq_alpha_fragment(&cc, imagin) == 1,
+           "'imagin' (6-char, freq 0) → fragment");
+    /* "small" may be length < 5 once stripped; only assert gate does
+     * not flag it. If BPE encoded " small" as one 6-byte token it has
+     * high freq and must pass. */
+    ASSERT(is_low_freq_alpha_fragment(&cc, small_id) == 0,
+           "'small' real word passes gate");
+    leo_free(&leo);
+    PASS();
+}
+
+static void test_leo_prompt_knowledge_low_for_foreign(void) {
+    TEST("leo_prompt_knowledge: low for foreign prompt, high for in-corpus");
+    Leo leo;
+    leo_init(&leo);
+    leo_ingest(&leo,
+        "Leo watches the rain. Leo listens. The light comes in yellow. "
+        "Leo has a stone. Leo puts his hand in the light. He waits. "
+        "The room is quiet. Leo hears it. The hand is warm. "
+        "Leo has a gift. He does not ask. Leo watches again.");
+    int p_ids[256];
+    int p_n = bpe_encode(&leo.bpe,
+                         (const uint8_t *)"Leo hand light rain room",
+                         (int)strlen("Leo hand light rain room"),
+                         p_ids, 256);
+    float known = leo_prompt_knowledge(&leo, p_ids, p_n);
+    int q_n = bpe_encode(&leo.bpe,
+                         (const uint8_t *)"pizza dragon volleyball",
+                         (int)strlen("pizza dragon volleyball"),
+                         p_ids, 256);
+    float unknown = leo_prompt_knowledge(&leo, p_ids, q_n);
+    ASSERT(known > unknown,
+           "in-corpus prompt has higher knowledge score than foreign");
+    leo_free(&leo);
+    PASS();
+}
+
 static void test_leo_field_trauma_trigger_raises_pain_and_chambers(void) {
     TEST("leo_field_trauma_trigger: raises pain + FEAR + VOID above threshold");
     LeoField f;
@@ -1512,6 +1577,8 @@ int main(void) {
     test_leo_generate_ex_honors_start_hint();
     test_compute_prompt_gravity_nonempty();
     test_leo_prompt_bootstrap_overlap_ratio();
+    test_leo_low_freq_alpha_fragment_skips_unseen_5_8_tokens();
+    test_leo_prompt_knowledge_low_for_foreign();
     test_leo_field_trauma_trigger_raises_pain_and_chambers();
     test_leo_respond_empty_prompt_falls_back();
     test_embedded_bootstrap_is_nonempty();

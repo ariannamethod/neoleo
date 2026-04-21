@@ -1141,10 +1141,14 @@ static float leo_field_candidate_bias(const LeoField *f, int candidate) {
         }
     }
     if (f->trauma > 0.2f && f->bootstrap_ids) {
-        int cap = f->n_bootstrap < 256 ? f->n_bootstrap : 256;
-        for (int i = 0; i < cap; i++) {
+        /* pull toward origin scales with trauma: more trauma → more
+         * bootstrap words in Leo's mouth. Python-legacy trauma.py
+         * describes this as "symphonic" — the wounded child returns
+         * to the dedication. No cap: all of Oleg's origin text is in
+         * range, not just the first 256 tokens. */
+        for (int i = 0; i < f->n_bootstrap; i++) {
             if (f->bootstrap_ids[i] == candidate) {
-                trauma = 0.5f * f->trauma;
+                trauma = 1.0f * f->trauma;
                 break;
             }
         }
@@ -1631,6 +1635,54 @@ static int is_standalone_whitelist_word(const BPE *bpe, int cand_id) {
     return is_common_short_word(b, s, e);
 }
 
+/* Frequency-based fragment rejection for tokens past the orphan-gate's
+ * length cap. A BPE merge produces tokens up to LEO_MAX_TOKEN_LEN; many
+ * land 5-8 chars, alpha-only, and *look* word-shaped but are actually
+ * random mid-word slices that never earned repetition ("thout" from
+ * "without", "magin" from "imagination"). Real words accumulate
+ * unigram freq through repeated use; fragments do not.
+ *
+ * Two cascading checks, both must pass to be considered real:
+ *   1) adaptive freq threshold — scales with corpus size. Fragments
+ *      in a big corpus need a big freq to survive; in a tiny corpus
+ *      the minimum is 3. This makes the gate self-calibrating.
+ *   2) bounded-version preference — if a " <content> " (space-bounded)
+ *      token exists in vocab, reject the unbounded form. Canonical
+ *      words live bounded; fragments live bare. */
+#define LEO_FREQ_GATE_MIN_LEN  5
+#define LEO_FREQ_GATE_MAX_LEN  8
+#define LEO_FREQ_GATE_MIN_T    3.0f
+#define LEO_FREQ_GATE_DIVISOR  5000.0f
+
+static int is_alpha_only_bytes(const uint8_t *b, int s, int e) {
+    for (int i = s; i < e; i++) {
+        uint8_t c = b[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) return 0;
+    }
+    return 1;
+}
+
+static int is_low_freq_alpha_fragment(const CandCollector2 *cc, int cand_id) {
+    if (!cc->bpe || !cc->cooc) return 0;
+    int len = cc->bpe->vocab_len[cand_id];
+    if (len < LEO_FREQ_GATE_MIN_LEN || len > LEO_FREQ_GATE_MAX_LEN) return 0;
+    const uint8_t *b = cc->bpe->vocab_bytes[cand_id];
+    /* Fragments live bare: if there is a leading or trailing whitespace
+     * boundary on this token, it already carries word-boundary shape —
+     * treat as word, pass. */
+    if (b[0] == ' ' || b[0] == '\n' || b[0] == '\r' || b[0] == '\t') return 0;
+    if (b[len-1] == ' ' || b[len-1] == '\n' || b[len-1] == '\r' || b[len-1] == '\t') return 0;
+    /* full content must be alpha-only for the gate to apply */
+    if (!is_alpha_only_bytes(b, 0, len)) return 0;
+    if (cand_id >= cc->cooc->freq_size) return 0;
+    /* adaptive threshold: minimum 3, or total_tokens / DIVISOR. Real
+     * words accumulate unigram freq at roughly (corpus / 5000) per
+     * token; fragments stay an order of magnitude below. */
+    float t = (float)cc->cooc->total_tokens / LEO_FREQ_GATE_DIVISOR;
+    if (t < LEO_FREQ_GATE_MIN_T) t = LEO_FREQ_GATE_MIN_T;
+    return cc->cooc->freq[cand_id] < t;
+}
+
 static int is_capital_glue_cand(const CandCollector2 *cc, int cand_id) {
     if (!cc->bpe || !cc->prev_ends_alpha) return 0;
     int first = bpe_token_first_byte(cc->bpe, cand_id);
@@ -1654,6 +1706,9 @@ static int cand_collect_tri(int c, float count, void *ud) {
     if (cc->bpe && is_orphan_fragment(cc->bpe, c)) return 0;
     /* boundary gate: hard-exclude capital-after-alpha glue */
     if (is_capital_glue_cand(cc, c)) return 0;
+    /* frequency gate: 5-8 char alpha-only tokens below freq threshold
+     * are BPE slice fragments that never earned word status */
+    if (is_low_freq_alpha_fragment(cc, c)) return 0;
     float s = cooc_get(cc->cooc, cc->prev1, c);
     float score = 0.7f * count + 0.3f * s;
     if (cc->gravity) {
@@ -1674,6 +1729,7 @@ static int cand_collect_bi(int dst, float count, void *ud) {
     if (cc->n >= cc->max) return 1;
     if (cc->bpe && is_orphan_fragment(cc->bpe, dst)) return 0;
     if (is_capital_glue_cand(cc, dst)) return 0;
+    if (is_low_freq_alpha_fragment(cc, dst)) return 0;
     float score = count;
     if (cc->gravity) {
         float alpha = cc->field ? leo_field_alpha_mod(cc->field) : 1.0f;
@@ -1714,14 +1770,29 @@ int leo_step_token(const Leo *leo, int prev2, int prev1, float temp) {
         return leo_choose_start(leo);
     }
 
-    /* anti-chain guard: if we literally just emitted a pure-space token
-     * after some prev2 (typical fallback recovery: alpha → space → ...),
-     * do not pick prev2 again — otherwise we loop "a <space> a <space> a".
-     * Zero the score so weighted_sample picks anything else; if *every*
-     * candidate ends up zero, sample falls back to uniform random. */
+    /* anti-chain guard. After a pure-space fallback (prev1 == 32),
+     * two classes of next-emit would form a chain:
+     *   (a) same token as prev2 — "a <space> a" pattern,
+     *   (b) another short standalone-whitelist word when prev2 was
+     *       itself one — "a <space> o <space> i <space> a" pattern.
+     * Both get their score zeroed. If *every* candidate ends up zero
+     * the sentence is over: emit '.' to close cleanly instead of
+     * letting weighted_sample fall back to uniform over the blocked
+     * set and reopen the chain. */
     if (prev1 == 32 && prev2 >= 0) {
-        for (int i = 0; i < cc.n; i++)
-            if (cand_id[i] == prev2) cand_sc[i] = 0.0f;
+        int prev2_is_short_wl =
+            is_standalone_whitelist_word(&leo->bpe, prev2);
+        int any_nonzero = 0;
+        for (int i = 0; i < cc.n; i++) {
+            if (cand_id[i] == prev2) { cand_sc[i] = 0.0f; continue; }
+            if (prev2_is_short_wl &&
+                is_standalone_whitelist_word(&leo->bpe, cand_id[i])) {
+                cand_sc[i] = 0.0f;
+                continue;
+            }
+            if (cand_sc[i] > 0) any_nonzero = 1;
+        }
+        if (!any_nonzero) return -1; /* no legit continuation → end sentence */
     }
 
     for (int i = 0; i < cc.n; i++)
@@ -2113,6 +2184,10 @@ static float leo_prompt_bootstrap_overlap(const LeoField *f,
  * before assertions run). Threshold 0.15 matches python-legacy
  * trauma.py's event threshold after the `overlap_ratio * 2` bump. */
 #define LEO_TRAUMA_THRESH  0.15f
+/* Knowledge floor: average unigram freq over recognized prompt tokens
+ * below which Leo is out-of-domain. Calibrated for 10-100KB corpora;
+ * common words sit well above (50-500), obscure tokens stay near 1-2. */
+#define LEO_KNOWLEDGE_FLOOR 4.0f
 static void leo_field_trauma_trigger(LeoField *f, float overlap) {
     if (overlap < LEO_TRAUMA_THRESH) return;
     f->pain = clampf(f->pain + 0.3f * overlap, 0.0f, 1.0f);
@@ -2120,6 +2195,24 @@ static void leo_field_trauma_trigger(LeoField *f, float overlap) {
         f->chamber_ext[LEO_CH_FEAR] + 0.4f * overlap, 0.0f, 1.0f);
     f->chamber_ext[LEO_CH_VOID] = clampf(
         f->chamber_ext[LEO_CH_VOID] + 0.2f * overlap, 0.0f, 1.0f);
+}
+
+/* Prompt-knowledge score: average unigram freq over non-zero prompt
+ * tokens. Low average = prompt lives outside Leo's learned sphere —
+ * he has little field mass to speak from. Returns 0 on empty prompt. */
+static float leo_prompt_knowledge(const Leo *leo, const int *p_ids, int p_n) {
+    if (p_n <= 0) return 0.0f;
+    float total = 0.0f;
+    int counted = 0;
+    for (int i = 0; i < p_n; i++) {
+        int id = p_ids[i];
+        if (id < 0 || id >= leo->cooc.freq_size) continue;
+        float f = leo->cooc.freq[id];
+        if (f <= 0) continue;
+        total += f;
+        counted++;
+    }
+    return counted > 0 ? total / (float)counted : 0.0f;
 }
 
 int leo_respond(Leo *leo, const char *prompt, char *out, int max_len) {
@@ -2144,6 +2237,18 @@ int leo_respond(Leo *leo, const char *prompt, char *out, int max_len) {
     float overlap = leo_prompt_bootstrap_overlap(&leo->field, p_ids, p_n);
     leo_field_trauma_trigger(&leo->field, overlap);
 
+    /* Level gate: "here I can speak, here I cannot." Knowledge score
+     * is average unigram freq over recognized prompt tokens. If the
+     * prompt lives outside Leo's learned sphere (score below a small
+     * floor), he is out of his depth. Treat it as a different kind
+     * of trauma — not echo-of-origin, but bewilderment — so the
+     * wounded voice still carries, and the reply stays short. */
+    float knowledge = leo_prompt_knowledge(leo, p_ids, p_n);
+    int out_of_domain = knowledge < LEO_KNOWLEDGE_FLOOR && p_n > 0;
+    if (out_of_domain) {
+        leo_field_trauma_trigger(&leo->field, 0.5f);
+    }
+
     /* body hears the prompt — anchor words drive chambers.
      * Two passes: exact+substring first, then cooc-inference for the
      * rest. This is super-token-style emergent anchor detection. */
@@ -2151,7 +2256,8 @@ int leo_respond(Leo *leo, const char *prompt, char *out, int max_len) {
     leo_field_chambers_feel_cooc(leo, prompt);
 
     leo->gravity = g;
-    int produced = leo_chain(leo, LEO_CHAIN_MIN, out, max_len);
+    int chain_len = out_of_domain ? 1 : LEO_CHAIN_MIN;
+    int produced = leo_chain(leo, chain_len, out, max_len);
     leo->gravity = NULL;
     free(g);
 
