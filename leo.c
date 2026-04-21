@@ -172,18 +172,37 @@ typedef struct {
     int new_id;      /* the token it becomes */
 } BPEMerge;
 
+/* Cached per-token byte-pattern flags. Computed once per token add
+ * (bpe_init for bytes 0-255, bpe_promote_slot for new merges) and
+ * read O(1) in hot-path candidate gates instead of re-scanning bytes
+ * and re-running whitelist strcmp loops on every step. */
+#define LEO_META_ORPHAN       (1 << 0)  /* is_orphan_fragment  (static) */
+#define LEO_META_STANDALONE   (1 << 1)  /* whitelisted standalone word  */
+#define LEO_META_FIRST_UPPER  (1 << 2)
+#define LEO_META_FIRST_LOWER  (1 << 3)
+#define LEO_META_FIRST_WS     (1 << 4)
+#define LEO_META_FIRST_PUNCT  (1 << 5)
+#define LEO_META_LAST_WORDCT  (1 << 6)  /* last byte is alpha/digit/'   */
+#define LEO_META_FREQ_CAND    (1 << 7)  /* 5-8 char alpha-only, no-bounds */
+
 typedef struct {
     BPEMerge merges[LEO_MAX_MERGES];
     int      n_merges;
     int      vocab_size;                         /* = 256 + n_merges */
     uint8_t  vocab_bytes[LEO_MAX_VOCAB][LEO_MAX_TOKEN_LEN];
     int      vocab_len[LEO_MAX_VOCAB];
+    uint8_t  vocab_meta[LEO_MAX_VOCAB];          /* LEO_META_* flags */
 
     /* pair counter for online learning: open hash by (left,right) */
     int      pair_left[LEO_PAIR_HASH];
     int      pair_right[LEO_PAIR_HASH];
     int      pair_count[LEO_PAIR_HASH];
 } BPE;
+
+/* forward declaration — defined below once is_common_short_word and
+ * related byte helpers are available. */
+static uint8_t bpe_compute_meta(const BPE *bpe, int id);
+static void bpe_populate_all_meta(BPE *bpe);
 
 static void bpe_init(BPE *bpe) {
     memset(bpe, 0, sizeof(*bpe));
@@ -197,6 +216,8 @@ static void bpe_init(BPE *bpe) {
         bpe->pair_right[i] = -1;
         bpe->pair_count[i] = 0;
     }
+    /* vocab_meta left all-zero here. leo_init / bpe_populate_all_meta
+     * fills it after the byte-helper functions are defined (below). */
 }
 
 static int bpe_pair_slot(BPE *bpe, int left, int right) {
@@ -290,6 +311,9 @@ static int bpe_promote_slot(BPE *bpe, int slot) {
     bpe->merges[bpe->n_merges].new_id = new_id;
     bpe->n_merges++;
     bpe->pair_count[slot] = 0;
+    /* cache gate flags for the new token so step_token's inner loop
+     * reads them O(1) instead of re-scanning bytes per candidate. */
+    bpe->vocab_meta[new_id] = bpe_compute_meta(bpe, new_id);
     return 1;
 }
 
@@ -1233,6 +1257,7 @@ static float leo_field_temperature_mult(const LeoField *f) {
 void leo_init(Leo *leo) {
     memset(leo, 0, sizeof(*leo));
     bpe_init(&leo->bpe);
+    bpe_populate_all_meta(&leo->bpe);  /* byte tokens 0-255 */
     cooc_init(&leo->cooc, LEO_COOC_MAX, LEO_MAX_VOCAB);
     bigram_init(&leo->bigrams, LEO_BIGRAM_MAX);
     trigram_init(&leo->trigrams, LEO_TRIGRAM_MAX);
@@ -1410,6 +1435,9 @@ int leo_load_state(Leo *leo, const char *path) {
     }
     /* pair_* hash stays zeroed from leo_init — it only matters during
      * ingest, and any new ingest will repopulate it. */
+    /* meta cache: recompute for every loaded token so hot-path gates
+     * hit the bit-flag fast path instead of zero-meta fallbacks. */
+    bpe_populate_all_meta(&leo->bpe);
 
     /* Cooc freq */
     int32_t freq_size = 0;
@@ -2040,18 +2068,78 @@ static int is_capital_glue_cand(const CandCollector2 *cc, int cand_id) {
     return 0;
 }
 
+/* ========================================================================
+ * TOKEN META CACHE — precomputed byte-pattern flags per BPE token.
+ *
+ * Populated once at token creation (bpe_init for bytes 0-255, promote_
+ * slot for new merges, populate_all_meta on state-load). Read O(1) in
+ * step_token's hot cand-collect loop instead of re-scanning vocab bytes
+ * and re-running whitelist strcmp loops on every candidate. Freq-gate
+ * keeps a dynamic freq check, but the static "is alpha-only 5-8 with
+ * no bounds" part rides the cache.
+ * ======================================================================== */
+
+static uint8_t bpe_compute_meta(const BPE *bpe, int id) {
+    uint8_t m = 0;
+    int len = bpe->vocab_len[id];
+    if (len <= 0) return 0;
+    const uint8_t *b = bpe->vocab_bytes[id];
+    /* first-byte class */
+    uint8_t first = b[0];
+    if (first >= 'A' && first <= 'Z') m |= LEO_META_FIRST_UPPER;
+    else if (first >= 'a' && first <= 'z') m |= LEO_META_FIRST_LOWER;
+    else if (first == ' ' || first == '\n' || first == '\r' || first == '\t') m |= LEO_META_FIRST_WS;
+    else if (first == '.' || first == ',' || first == '!' || first == '?' ||
+             first == ';' || first == ':') m |= LEO_META_FIRST_PUNCT;
+    /* last-byte word-continuation (alpha/digit/apostrophe) */
+    uint8_t last = b[len - 1];
+    if ((last >= 'a' && last <= 'z') || (last >= 'A' && last <= 'Z') ||
+        (last >= '0' && last <= '9') || last == '\'') m |= LEO_META_LAST_WORDCT;
+    /* orphan-fragment: same logic as is_orphan_fragment, inlined. */
+    if (is_orphan_fragment(bpe, id)) m |= LEO_META_ORPHAN;
+    /* standalone whitelist word (stripped content in is_common_short_word) */
+    if (is_standalone_whitelist_word(bpe, id)) m |= LEO_META_STANDALONE;
+    /* freq-gate candidate: 5-8 char, alpha-only, no whitespace bounds */
+    if (len >= LEO_FREQ_GATE_MIN_LEN && len <= LEO_FREQ_GATE_MAX_LEN &&
+        !(b[0] == ' ' || b[0] == '\n' || b[0] == '\r' || b[0] == '\t') &&
+        !(b[len-1] == ' ' || b[len-1] == '\n' || b[len-1] == '\r' || b[len-1] == '\t') &&
+        is_alpha_only_bytes(b, 0, len)) {
+        m |= LEO_META_FREQ_CAND;
+    }
+    return m;
+}
+
+static void bpe_populate_all_meta(BPE *bpe) {
+    for (int i = 0; i < bpe->vocab_size; i++) {
+        bpe->vocab_meta[i] = bpe_compute_meta(bpe, i);
+    }
+}
+
+/* Hot-path gate check using the precomputed meta cache. Returns 1
+ * if candidate should be rejected. Falls back to the live functions
+ * only if meta for the token is genuinely zero (unseen token edge
+ * case). O(1) in the common path. */
+static int cand_gate_reject(const CandCollector2 *cc, int cand_id) {
+    if (!cc->bpe) return 0;
+    uint8_t m = cc->bpe->vocab_meta[cand_id];
+    if (m & LEO_META_ORPHAN) return 1;
+    if (cc->prev_ends_alpha) {
+        if (m & LEO_META_FIRST_UPPER) return 1;
+        if ((m & LEO_META_FIRST_LOWER) && (m & LEO_META_STANDALONE)) return 1;
+    }
+    if ((m & LEO_META_FREQ_CAND) && cc->cooc &&
+        cand_id < cc->cooc->freq_size) {
+        float t = (float)cc->cooc->total_tokens / LEO_FREQ_GATE_DIVISOR;
+        if (t < LEO_FREQ_GATE_MIN_T) t = LEO_FREQ_GATE_MIN_T;
+        if (cc->cooc->freq[cand_id] < t) return 1;
+    }
+    return 0;
+}
+
 static int cand_collect_tri(int c, float count, void *ud) {
     CandCollector2 *cc = (CandCollector2 *)ud;
     if (cc->n >= cc->max) return 1;
-    /* real-word gate: reject orphan fragments outright. If all
-     * candidates turn out to be orphans, the step falls back to
-     * choose_start (clean-seed tokens), so we never emit "m" */
-    if (cc->bpe && is_orphan_fragment(cc->bpe, c)) return 0;
-    /* boundary gate: hard-exclude capital-after-alpha glue */
-    if (is_capital_glue_cand(cc, c)) return 0;
-    /* frequency gate: 5-8 char alpha-only tokens below freq threshold
-     * are BPE slice fragments that never earned word status */
-    if (is_low_freq_alpha_fragment(cc, c)) return 0;
+    if (cand_gate_reject(cc, c)) return 0;
     float s = cooc_get(cc->cooc, cc->prev1, c);
     float score = 0.7f * count + 0.3f * s;
     if (cc->gravity) {
@@ -2070,9 +2158,7 @@ static int cand_collect_tri(int c, float count, void *ud) {
 static int cand_collect_bi(int dst, float count, void *ud) {
     CandCollector2 *cc = (CandCollector2 *)ud;
     if (cc->n >= cc->max) return 1;
-    if (cc->bpe && is_orphan_fragment(cc->bpe, dst)) return 0;
-    if (is_capital_glue_cand(cc, dst)) return 0;
-    if (is_low_freq_alpha_fragment(cc, dst)) return 0;
+    if (cand_gate_reject(cc, dst)) return 0;
     float score = count;
     if (cc->gravity) {
         float alpha = cc->field ? leo_field_alpha_mod(cc->field) : 1.0f;
@@ -2914,9 +3000,11 @@ int main(int argc, char **argv) {
      * explicitly asked for --fresh. */
     int resumed = 0;
     if (!mode_fresh) {
+        double _tl = leo_ns();
         if (leo_load_state(&leo, state_path)) {
-            fprintf(stderr, "[resume] %s — step=%ld vocab=%d\n",
-                    state_path, leo.step, leo.bpe.vocab_size);
+            fprintf(stderr, "[resume] %s — step=%ld vocab=%d (%.0fms)\n",
+                    state_path, leo.step, leo.bpe.vocab_size,
+                    (leo_ns() - _tl) / 1e6);
             resumed = 1;
         }
     }
@@ -2955,8 +3043,11 @@ int main(int argc, char **argv) {
 
     if (one_prompt) {
         char reply[4096];
+        double _tr = leo_ns();
         leo_respond(&leo, one_prompt, reply, sizeof(reply));
+        double respond_ms = (leo_ns() - _tr) / 1e6;
         printf("you> %s\nLeo: %s\n", one_prompt, reply);
+        fprintf(stderr, "[respond] %.0fms\n", respond_ms);
     } else if (mode_repl) {
         fprintf(stderr, "[repl] type anything. 'quit' or Ctrl-D to exit. "
                         "/stats for counters.\n\n");
@@ -3028,9 +3119,11 @@ int main(int argc, char **argv) {
 
     /* persist before exit — Leo grows across sessions. Saving after
      * --demo too, so the organism carries what it just heard. */
+    double _ts = leo_ns();
     if (leo_save_state(&leo, state_path))
-        fprintf(stderr, "[save] %s — step=%ld vocab=%d\n",
-                state_path, leo.step, leo.bpe.vocab_size);
+        fprintf(stderr, "[save] %s — step=%ld vocab=%d (%.0fms)\n",
+                state_path, leo.step, leo.bpe.vocab_size,
+                (leo_ns() - _ts) / 1e6);
 
     if (getenv("LEO_PROFILE")) leo_profile_report(stderr);
 
