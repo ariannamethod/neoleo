@@ -1098,6 +1098,74 @@ static void test_compute_prompt_gravity_nonempty(void) {
     PASS();
 }
 
+static void test_leo_field_trauma_trigger_raises_pain_and_chambers(void) {
+    TEST("leo_field_trauma_trigger: raises pain + FEAR + VOID above threshold");
+    LeoField f;
+    leo_field_init(&f, 1024);
+    /* Below threshold → no-op. */
+    float pain0 = f.pain;
+    leo_field_trauma_trigger(&f, 0.10f);
+    ASSERT(f.pain == pain0, "overlap 0.10 < threshold → no change");
+    ASSERT(f.chamber_ext[LEO_CH_FEAR] == 0.0f, "FEAR untouched");
+    ASSERT(f.chamber_ext[LEO_CH_VOID] == 0.0f, "VOID untouched");
+    /* Above threshold → pain + FEAR + VOID rise, proportional to overlap. */
+    leo_field_trauma_trigger(&f, 0.50f);
+    ASSERT(f.pain > 0.0f, "pain raised after trigger");
+    ASSERT(f.chamber_ext[LEO_CH_FEAR] > 0.0f, "FEAR raised after trigger");
+    ASSERT(f.chamber_ext[LEO_CH_VOID] > 0.0f, "VOID raised after trigger");
+    /* FEAR rises faster than VOID (stronger coefficient). */
+    ASSERT(f.chamber_ext[LEO_CH_FEAR] > f.chamber_ext[LEO_CH_VOID],
+           "FEAR > VOID (wounded > drained)");
+    /* All values bounded to [0, 1]. */
+    leo_field_trauma_trigger(&f, 0.99f);
+    leo_field_trauma_trigger(&f, 0.99f);
+    leo_field_trauma_trigger(&f, 0.99f);
+    ASSERT(f.pain <= 1.0f && f.chamber_ext[LEO_CH_FEAR] <= 1.0f &&
+           f.chamber_ext[LEO_CH_VOID] <= 1.0f,
+           "all clamped to 1.0 after repeated saturation");
+    leo_field_free(&f);
+    PASS();
+}
+
+static void test_leo_prompt_bootstrap_overlap_ratio(void) {
+    TEST("leo_prompt_bootstrap_overlap: ratio computed correctly");
+    Leo leo;
+    leo_init(&leo);
+    leo_ingest(&leo, LEO_EMBEDDED_BOOTSTRAP);
+    int boot_ids[512];
+    int boot_n = bpe_encode(&leo.bpe,
+                            (const uint8_t *)LEO_EMBEDDED_BOOTSTRAP,
+                            (int)strlen(LEO_EMBEDDED_BOOTSTRAP),
+                            boot_ids, 512);
+    leo_field_set_bootstrap(&leo.field, boot_ids, boot_n);
+
+    /* Zero overlap on empty input */
+    ASSERT(leo_prompt_bootstrap_overlap(&leo.field, NULL, 0) == 0.0f,
+           "no prompt → 0 overlap");
+
+    /* Overlap on a bootstrap-echoing prompt */
+    int p_ids[256];
+    int p_n = bpe_encode(&leo.bpe,
+                         (const uint8_t *)"Leo listens resonance origin",
+                         (int)strlen("Leo listens resonance origin"),
+                         p_ids, 256);
+    float ratio = leo_prompt_bootstrap_overlap(&leo.field, p_ids, p_n);
+    ASSERT(ratio > 0.2f, "bootstrap-echoing prompt has overlap > 0.2");
+    ASSERT(ratio <= 1.0f, "ratio bounded to 1");
+
+    /* Overlap on a mostly-foreign prompt */
+    int q_ids[256];
+    int q_n = bpe_encode(&leo.bpe,
+                         (const uint8_t *)"pizza dragon spacecraft volleyball",
+                         (int)strlen("pizza dragon spacecraft volleyball"),
+                         q_ids, 256);
+    float ratio2 = leo_prompt_bootstrap_overlap(&leo.field, q_ids, q_n);
+    ASSERT(ratio2 < ratio, "foreign prompt has lower overlap than bootstrap-echoing one");
+
+    leo_free(&leo);
+    PASS();
+}
+
 static void test_leo_respond_empty_prompt_falls_back(void) {
     TEST("leo_respond: empty prompt → plain chain (no crash)");
     Leo leo;
@@ -1443,6 +1511,8 @@ int main(void) {
     test_leo_generate_best_picks_coherent();
     test_leo_generate_ex_honors_start_hint();
     test_compute_prompt_gravity_nonempty();
+    test_leo_prompt_bootstrap_overlap_ratio();
+    test_leo_field_trauma_trigger_raises_pain_and_chambers();
     test_leo_respond_empty_prompt_falls_back();
     test_embedded_bootstrap_is_nonempty();
     test_leo_field_init_free();

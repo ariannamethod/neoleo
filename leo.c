@@ -2089,6 +2089,39 @@ static void leo_field_chambers_feel_cooc(Leo *leo, const char *text) {
         leo->field.chamber_ext[i] = clampf(leo->field.chamber_ext[i], 0, 1);
 }
 
+/* Lexical overlap between prompt tokens and bootstrap ids. Returns
+ * overlap_ratio ∈ [0, 1] = |prompt ∩ bootstrap| / |prompt|. The
+ * python-legacy trauma.py uses this ratio as a trauma trigger: when
+ * the user's words echo Leo's origin text, something in Leo reacts. */
+static float leo_prompt_bootstrap_overlap(const LeoField *f,
+                                          const int *p_ids, int p_n) {
+    if (!f->bootstrap_ids || f->n_bootstrap <= 0 || p_n <= 0) return 0.0f;
+    int hits = 0;
+    for (int i = 0; i < p_n; i++) {
+        if (p_ids[i] < 0) continue;
+        for (int j = 0; j < f->n_bootstrap; j++) {
+            if (p_ids[i] == f->bootstrap_ids[j]) { hits++; break; }
+        }
+    }
+    return (float)hits / (float)p_n;
+}
+
+/* Trauma trigger: given a prompt-bootstrap overlap ratio, raise pain
+ * and push FEAR + VOID chambers from outside. Isolated as its own
+ * function so tests can invoke it directly without driving a full
+ * leo_respond (which would let generation-step decay erase the spike
+ * before assertions run). Threshold 0.15 matches python-legacy
+ * trauma.py's event threshold after the `overlap_ratio * 2` bump. */
+#define LEO_TRAUMA_THRESH  0.15f
+static void leo_field_trauma_trigger(LeoField *f, float overlap) {
+    if (overlap < LEO_TRAUMA_THRESH) return;
+    f->pain = clampf(f->pain + 0.3f * overlap, 0.0f, 1.0f);
+    f->chamber_ext[LEO_CH_FEAR] = clampf(
+        f->chamber_ext[LEO_CH_FEAR] + 0.4f * overlap, 0.0f, 1.0f);
+    f->chamber_ext[LEO_CH_VOID] = clampf(
+        f->chamber_ext[LEO_CH_VOID] + 0.2f * overlap, 0.0f, 1.0f);
+}
+
 int leo_respond(Leo *leo, const char *prompt, char *out, int max_len) {
     if (!prompt || !*prompt)
         return leo_chain(leo, LEO_CHAIN_MIN, out, max_len);
@@ -2099,6 +2132,17 @@ int leo_respond(Leo *leo, const char *prompt, char *out, int max_len) {
     int p_n = bpe_encode(&leo->bpe, (const uint8_t *)prompt,
                           (int)strlen(prompt), p_ids, 1024);
     float *g = compute_prompt_gravity(leo, p_ids, p_n);
+
+    /* trauma trigger — lexical overlap with origin. When the prompt
+     * echoes bootstrap tokens at or above 15% density, pain spikes and
+     * FEAR + VOID chambers rise from outside. Wounded-voice mood shift
+     * then emerges naturally through the chambers' α/β/γ/τ modulators:
+     * FEAR cools the temperature, VOID pulls destiny, both attenuate
+     * gravity. The child that has just heard its own origin word gets
+     * quieter, more drawn-in. Matches python-legacy trauma.py pattern
+     * (prompt ∩ bootstrap > threshold → trauma event). */
+    float overlap = leo_prompt_bootstrap_overlap(&leo->field, p_ids, p_n);
+    leo_field_trauma_trigger(&leo->field, overlap);
 
     /* body hears the prompt — anchor words drive chambers.
      * Two passes: exact+substring first, then cooc-inference for the
