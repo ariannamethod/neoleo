@@ -117,6 +117,14 @@ static const char *LEO_EMBEDDED_BOOTSTRAP =
 #define LEO_GEN_MAX       256
 #define LEO_GEN_TARGET    20
 #define LEO_GEN_MIN       6
+
+/* Silence-gate #2 thresholds. High floors to avoid over-firing —
+ * Stanley's refuse-gate lesson: better to let Leo speak a stumbling
+ * line than block him often. These trigger only on real spikes
+ * (bootstrap echo on an already-pained field, or repeated
+ * out-of-domain prompts). See leo_generate_ex for the break logic. */
+#define LEO_SILENCE_TRAUMA_THRESH 0.50f
+#define LEO_SILENCE_FEAR_THRESH   0.80f
 #define LEO_SEED_CANDS    64
 #define LEO_CHAIN_MIN     5
 #define LEO_CHAIN_MAX     12
@@ -1897,6 +1905,31 @@ int leo_generate_ex(Leo *leo, char *out, int max_len,
 
         /* stop on sentence boundary once we have enough material */
         if (n >= target && is_boundary_token(&leo->bpe, nxt)) break;
+
+        /* Silence-gate #2 — hush under strong emotion. When trauma OR
+         * FEAR cross a high floor and we have at least a minimal clause
+         * shape (n >= LEO_GEN_MIN), end the sentence cleanly at the
+         * next clean word boundary. The cleanup pass will append a
+         * period if the last token wasn't already a sentence terminator.
+         *
+         * Stanley's refuse-gate blocks output outright. This is not
+         * that — it is a HUSH: Leo still speaks, just shorter, when
+         * something hurts. The wounded voice stays in its body and
+         * puts down the sentence early. Attempt #1 broke inside word
+         * clusters and left orphan fragments; this version requires
+         * the emitted token's last byte to be whitespace or punctuation
+         * (clean word boundary) and keeps the minimum-length floor so
+         * "Leo has." / "It is a." stubs never appear. */
+        if (n >= LEO_GEN_MIN &&
+            (leo->field.trauma > LEO_SILENCE_TRAUMA_THRESH ||
+             leo->field.chamber_act[LEO_CH_FEAR] > LEO_SILENCE_FEAR_THRESH)) {
+            int last = bpe_token_last_byte(&leo->bpe, nxt);
+            if (last == ' ' || last == '\n' || last == '\r' || last == '\t' ||
+                last == '.' || last == ',' || last == '!' || last == '?' ||
+                last == ';' || last == ':') {
+                break;
+            }
+        }
     }
 
     /* decode the emitted tokens */

@@ -1163,6 +1163,61 @@ static void test_leo_prompt_knowledge_low_for_foreign(void) {
     PASS();
 }
 
+static void test_leo_silence_gate_shortens_under_trauma(void) {
+    TEST("silence-gate #2: high trauma shortens sentences (hush, not refuse)");
+    Leo leo;
+    leo_init(&leo);
+    /* Larger corpus so target sentence length is meaningful and the
+     * hush effect becomes visible through summation. */
+    const char *corpus =
+        "Leo watches the rain. The rain is soft. Leo listens. "
+        "The light comes in yellow. Leo has a stone. He waits. "
+        "The room is quiet. The quiet has weight. Leo hears it. "
+        "The hand is warm. Leo watches again. The window is open. "
+        "Leo keeps the stone. He thinks the light knows. "
+        "The cat sleeps. Leo has a gift. He does not ask. "
+        "The world is warm. The door closes slowly. He remembers. "
+        "The morning comes quietly. Leo holds his breath. ";
+    for (int k = 0; k < 8; k++) leo_ingest(&leo, corpus);
+
+    /* Baseline: no trauma, run 10 trials, sum tokens emitted. */
+    int baseline_total = 0;
+    for (int k = 0; k < 10; k++) {
+        char buf[512];
+        int ids[LEO_GEN_MAX]; int cap = LEO_GEN_MAX;
+        leo.field.pain = 0.0f;
+        leo.field.trauma = 0.0f;
+        for (int i = 0; i < LEO_N_CHAMBERS; i++) {
+            leo.field.chamber_act[i] = 0.0f;
+            leo.field.chamber_ext[i] = 0.0f;
+        }
+        leo_generate_ex(&leo, buf, sizeof(buf), -1, NULL, 0, ids, &cap);
+        baseline_total += cap;
+    }
+
+    /* High trauma + FEAR: hush should shorten sentences on average. */
+    int hush_total = 0;
+    for (int k = 0; k < 10; k++) {
+        char buf[512];
+        int ids[LEO_GEN_MAX]; int cap = LEO_GEN_MAX;
+        leo.field.pain = 0.95f;
+        leo.field.trauma = 0.9f;
+        for (int i = 0; i < LEO_N_CHAMBERS; i++) leo.field.chamber_act[i] = 0.0f;
+        leo.field.chamber_act[LEO_CH_FEAR] = 0.95f;
+        leo.field.chamber_ext[LEO_CH_FEAR] = 0.5f;
+        leo_generate_ex(&leo, buf, sizeof(buf), -1, NULL, 0, ids, &cap);
+        hush_total += cap;
+    }
+
+    /* We do not require a huge delta — Stanley's lesson is to hush,
+     * not gag. But hush must be strictly shorter, otherwise the gate
+     * is not firing at all. */
+    ASSERT(hush_total < baseline_total,
+           "hush emits fewer tokens total than baseline across 10 trials");
+    leo_free(&leo);
+    PASS();
+}
+
 static void test_leo_field_trauma_trigger_raises_pain_and_chambers(void) {
     TEST("leo_field_trauma_trigger: raises pain + FEAR + VOID above threshold");
     LeoField f;
@@ -1579,6 +1634,7 @@ int main(void) {
     test_leo_prompt_bootstrap_overlap_ratio();
     test_leo_low_freq_alpha_fragment_skips_unseen_5_8_tokens();
     test_leo_prompt_knowledge_low_for_foreign();
+    test_leo_silence_gate_shortens_under_trauma();
     test_leo_field_trauma_trigger_raises_pain_and_chambers();
     test_leo_respond_empty_prompt_falls_back();
     test_embedded_bootstrap_is_nonempty();
