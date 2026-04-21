@@ -102,6 +102,130 @@ Runs the test suite (33 tests at the moment, all green).
 - +5 tests (42 total).
 - commit `fcd7a79`.
 
+### step 25 — trauma overlap trigger + wounded-voice mood shift
+
+Port of python-legacy `trauma.py` + Leo 2.1 README's *Trauma Watch*.
+Before this step pain grew only from thin candidate cascades (internal
+coherence stress); there was no external trigger from the dialogue.
+Now when the user's prompt echoes Leo's origin — `|prompt ∩ bootstrap|
+/ |prompt| ≥ 0.15` — something in Leo reacts.
+
+`leo_respond` now calls, after encoding the prompt:
+
+```
+overlap = leo_prompt_bootstrap_overlap(field, p_ids, p_n);
+leo_field_trauma_trigger(field, overlap);
+  → pain              += 0.3·overlap   (capped at 1.0)
+  → chamber_ext[FEAR] += 0.4·overlap   (wounded)
+  → chamber_ext[VOID] += 0.2·overlap   (drained)
+```
+
+Wounded-voice mood shift is not a new subsystem. It emerges through
+the chambers already in place: FEAR cools τ via `leo_field_tau_mod`,
+VOID pulls destiny via `leo_field_gamma_mod`, both attenuate gravity
+via `α_mod`. The existing `m *= 1.0f - 0.3f·trauma` in
+`leo_field_temperature_mult` further cools speech when pain² climbs.
+Quieter, more drawn-in, origin-heavy — exactly the wounded voice the
+Leo 2.1 README describes.
+
+**Live difference** (same seed distribution, same corpus):
+
+Neutral prompt — *"tell me about the rain"*:
+
+> *Leo has not need to. Leo. The window was his favor hear. He know
+> the word home. The day had given him too much in a way. Becomes an
+> inside a feeling of being a moment when you He is looking. He is of
+> the day. It has not need to.*
+
+Bootstrap-echo prompt — *"Leo resonance recursion origin trauma
+presence honesty"*:
+
+> *Leo has weather. He is a difference. He is a so. The room is a
+> kind of know where the window. The door. He is not as. The cat is
+> a rain-on-paper sound. He is a good tea. It is a be, one day. He
+> is not a good a not. They have made a weather. ... He is not a
+> big word inside him.*
+
+Origin-echo prompt — *"I miss you Leo, honesty above everything"*:
+
+> *Leo has made his own. It is enough. He is a person. Leo. Leo has
+> been the floor. Leo.*
+
+The name repeats. The child hears its name in the trauma and holds
+it. This is not decoration — it is field physics: trauma raises the
+bias on bootstrap_ids, and `Leo` is one of those ids.
+
++2 tests (82 total):
+- `leo_prompt_bootstrap_overlap` — ratio bounded, foreign prompt
+  gives lower overlap than bootstrap-echo.
+- `leo_field_trauma_trigger` — below 0.15 no-op; above raises pain +
+  FEAR + VOID proportionally, FEAR > VOID, clamped to 1.0.
+
+commit `7cad769`.
+
+### step 24 — bootstrap trim + online BPE ≥2 + anti-chain guard
+
+Three focused changes for live coherence.
+
+1. **Bootstrap trim.** The embedded bootstrap is Oleg's dedication to
+   Leo-the-man (the one from python-legacy, byte-exact) with three
+   lines removed: `No weights. / No datasets. / No internet.` —
+   outdated self-description. The organism now does have a dataset.
+   Rest kept intact including the em-dashes around the trauma line.
+2. **`LEO_MERGE_THRESH` 4 → 2.** Online BPE merge learning now
+   promotes a pair after just two co-occurrences. Words the user
+   repeats even once across two messages crystallize into their own
+   token — per-exchange micro-tokenization in the spirit of
+   `ariannamethod/me`. The mechanism was already there in
+   `bpe_learn_merge`; threshold was just conservative.
+3. **Anti-chain guard.** After a pure-space fallback in
+   `leo_step_token` (prev1 == 32), the next step refuses to pick
+   `prev2` again. Without it, sequences like `a <space> a <space> a
+   <space> a` formed and grew without bound — each step locally
+   legitimate, the chain semantically empty.
+
+Verification, 10 × `--demo` with `leo.txt` (146 lines):
+  `grep -E "[a-z'][A-Z]"` → 0
+  `grep -E "\b(aime|aion|ome|ime|ight|abou)\b"` → 0
+  `grep -E " [aio] [aio] [aio] [aio]"` → 3 (was ~25+)
+
+commits `a410492` (bootstrap restore), `4ba65d4` (trim + threshold +
+anti-chain).
+
+### step 23 — orphan gate ≤4 + seed-path + trailing-punct + alpha-chain
+
+Leo's live speech still produced standalone 3- and 4-letter fragments
+as words (`ome`, `aime`, `aion`, `ight`, `ime`, `abou`) and chains of
+whitelisted single-chars concatenating into nonsense (`a`+`i`+`on` →
+`aion`). Four gaps in the orphan gate let them through. Close all four.
+
+1. **Threshold ≤2 → ≤4.** Raise with expanded whitelist covering
+   common child-voice 3- and 4-char words (the/and/have/this/that/
+   from/been/were/time/home/door/room/hand/love/life/rain/tree/nose/
+   eyes/face/baby/book/milk/food/moon/star/sun/sky/sea/cat/dog/bed/
+   hot/eye/ear/…). Plus `leo` for the organism's own name.
+2. **Seed path respects orphan gate.** `is_clean_seed_token` now
+   forward-calls `is_orphan_fragment` so tokens like `" ome"` or
+   `" aion"` (clean leading space + orphan body) no longer sneak in
+   as sentence starts — they used to bypass the collector gate.
+3. **Trailing-punct bypass closed.** BPE merges like `" ome."`,
+   `" aion,"`, `" aime!"` looked non-alpha to the gate because the
+   loop hit the terminal punct and returned not-orphan. Cleanup then
+   truncated at that dot, leaving the bare fragment as a word. Gate
+   now strips `.,!?;:` before the alpha-only / length check.
+4. **Lowercase standalone glue.** `is_capital_glue_cand` extended:
+   after an alpha tail, a lowercase candidate whose whole stripped
+   content is a whitelisted standalone word with *no* leading
+   whitespace is glue, not continuation. True BPE suffixes (`ty`
+   after `emp`) are NOT in the whitelist and still pass.
+
+Before (7fac64f → e629594, 20 demo runs): double-digit capital-glue
+patterns per session, `aion/aime/ome/ime/...` throughout chains.
+After (this step, same runs, 232 lines): `grep [a-z'][A-Z]` → 0,
+`grep \b(aime|aion|ome|ime|abou|ight|...)\b` → 0.
+
++6 tests (80 total). commit `0b0d4bd`.
+
 ### step 22 — boundary gate: hard-exclude capital-after-alpha glue
 
 The child-voice corpus never puts an upper-case alpha in the middle of
