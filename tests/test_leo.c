@@ -1947,6 +1947,84 @@ static void test_leo_observe_thought_moves_chambers(void) {
 }
 
 /* ================================================================
+ * phase4 — islands (state clustering)
+ * ================================================================ */
+
+static void test_leo_islands_first_seed(void) {
+    TEST("leo_islands_assign: first soma slot seeds island 0");
+    Leo leo;
+    leo_init(&leo);
+    ASSERT(leo.field.n_islands == 0, "fresh field has no islands");
+    ASSERT(leo.field.current_island == -1, "current_island starts at -1");
+    leo.field.chamber_act[LEO_CH_LOVE] = 0.5f;
+    leo_soma_store(&leo, 0);
+    int idx = leo_islands_assign(&leo);
+    ASSERT(idx == 0, "first assign returns index 0");
+    ASSERT(leo.field.n_islands == 1, "n_islands grew to 1");
+    ASSERT(leo.field.current_island == 0, "current_island set to 0");
+    ASSERT(leo.field.islands[0].count == 1, "island count = 1");
+    leo_free(&leo);
+    PASS();
+}
+
+static void test_leo_islands_join_close(void) {
+    TEST("leo_islands_assign: close states join existing island");
+    Leo leo;
+    leo_init(&leo);
+    leo.field.chamber_act[LEO_CH_LOVE] = 0.5f;
+    leo_soma_store(&leo, 0);
+    leo_islands_assign(&leo);
+    /* very small perturbation — should join the same island */
+    leo.field.chamber_act[LEO_CH_LOVE] = 0.55f;
+    leo_soma_store(&leo, 0);
+    int idx = leo_islands_assign(&leo);
+    ASSERT(idx == 0, "close state joins island 0");
+    ASSERT(leo.field.n_islands == 1, "no new island created");
+    ASSERT(leo.field.islands[0].count == 2, "island count = 2");
+    leo_free(&leo);
+    PASS();
+}
+
+static void test_leo_islands_create_far(void) {
+    TEST("leo_islands_assign: far state seeds a new island");
+    Leo leo;
+    leo_init(&leo);
+    leo.field.chamber_act[LEO_CH_LOVE] = 0.0f;
+    leo.field.chamber_act[LEO_CH_FEAR] = 0.0f;
+    leo_soma_store(&leo, 0);
+    leo_islands_assign(&leo);
+    /* drastic state change — should exceed THRESH and create island 1 */
+    for (int c = 0; c < LEO_N_CHAMBERS; c++) leo.field.chamber_act[c] = 0.0f;
+    leo.field.chamber_act[LEO_CH_FEAR] = 0.95f;
+    leo.field.chamber_act[LEO_CH_RAGE] = 0.85f;
+    leo_soma_store(&leo, 0);
+    int idx = leo_islands_assign(&leo);
+    ASSERT(idx == 1, "far state seeds island 1");
+    ASSERT(leo.field.n_islands == 2, "n_islands grew to 2");
+    leo_free(&leo);
+    PASS();
+}
+
+static void test_leo_islands_centroid_drifts(void) {
+    TEST("leo_islands_assign: centroid drifts toward new points");
+    Leo leo;
+    leo_init(&leo);
+    leo.field.chamber_act[LEO_CH_LOVE] = 0.2f;
+    leo_soma_store(&leo, 0);
+    leo_islands_assign(&leo);
+    float c0 = leo.field.islands[0].centroid[LEO_CH_LOVE];
+    /* second point pulls centroid up */
+    leo.field.chamber_act[LEO_CH_LOVE] = 0.4f;
+    leo_soma_store(&leo, 0);
+    leo_islands_assign(&leo);
+    float c1 = leo.field.islands[0].centroid[LEO_CH_LOVE];
+    ASSERT(c1 > c0, "centroid LOVE moves up after second visit");
+    ASSERT(c1 < 0.4f, "centroid is between the two points (running average)");
+    leo_free(&leo);
+    PASS();
+}
+
+/* ================================================================
  * cross-organ integration tests
  * ================================================================ */
 
@@ -2163,6 +2241,12 @@ int main(void) {
     test_leo_mathbrain_step_decreases_loss();
     test_leo_mathbrain_advisor_overwhelm();
     test_leo_mathbrain_advisor_boredom();
+
+    /* phase4 — islands */
+    test_leo_islands_first_seed();
+    test_leo_islands_join_close();
+    test_leo_islands_create_far();
+    test_leo_islands_centroid_drifts();
 
     /* cross-organ integration */
     test_leo_state_roundtrip_organisms();

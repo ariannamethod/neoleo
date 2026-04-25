@@ -1685,6 +1685,108 @@ trajectory / memories), `dream`, `santaclaus`, `school`, `game`.
 Body of organs growing. The grammar is working. The voice is
 starting to feel.
 
+### step 35 — phase4 islands: state clusters on the soma stream
+
+Islands answer the question *"where in inner-state space am I
+right now?"* with a stable, evolving label. Not a planner. Not
+a routing decision. A memory of the field's natural attractors —
+"this kind of moment has happened before, and is happening
+again". Built directly on top of soma: each new soma slot is an
+8-D point (chambers + valence + arousal) that either joins the
+nearest island (centroid drifts a fraction of the way toward
+the new point — proper running average) or seeds a new one if no
+island is close enough.
+
+C addition: `LeoIsland` POD struct + a 16-island array on
+`LeoField`:
+
+```c
+typedef struct {
+    float    centroid[8];   /* chambers[6] + valence + arousal */
+    int32_t  count;          /* visits */
+    int64_t  last_step;
+    int64_t  created_step;
+    uint8_t  _pad[8];        /* stable on-disk size */
+} LeoIsland;
+```
+
+Functions:
+
+- `leo_islands_assign(leo)` — reads the most-recent soma slot,
+  computes Euclidean distance to every existing centroid, joins
+  the closest one within `LEO_ISLAND_THRESH = 0.55` (online
+  running-average centroid update + count++), or seeds a new
+  island at `n_islands < LEO_ISLAND_MAX = 16`. Sets
+  `current_island` so phase4 bridges (next step) can read it.
+  Graceful degrade once full: closest island wins regardless of
+  distance, no new islands created.
+- `leo_islands_dump` — prints index, count, last_step, centroid
+  per island, with the current one marked.
+
+Persistence: appended to `leo.state` after the mathbrain block,
+sentinel dimensions guard against future shape bumps. Old state
+files load with empty islands (`n_islands = 0`,
+`current_island = -1`).
+
+**Worker integration** — `workerLoop` order updates:
+
+```
+runRing0 / runRing1 / runRing2  → observe
+metaleo.Process                  → maybe override-observe
+SomaSnapshot                     → store one slot
+MathbrainStep                    → forward + train + advisor
+IslandsAssign                    → cluster the slot
+```
+
+Each step strictly after the previous: islands read the slot
+that was just stored, mathbrain features include the soma
+trajectory that just changed, etc. Sequential discipline keeps
+the C side thread-safe under one wlock per step.
+
+REPL gets `/islands`: total / max + current marker + per-island
+count / last_step / centroid breakdown.
+
+**Smoke** (`./leogo/leogo leo.txt --repl`, fresh state, 5
+emotionally-charged prompts spaced 2 s, then `/islands`):
+
+```
+/islands
+> islands:     2/16 (current=1)
+>   [0] count=1 last_step=95581
+>       FEAR 0.14 LOVE 1.00 RAGE 0.16 VOID 1.00 FLOW 0.08 CMPLX 0.45
+>       val -0.06 aro 0.76
+>   [1] count=1 last_step=95831
+>       FEAR 0.16 LOVE 0.47 RAGE 0.00 VOID 0.47 FLOW 0.14 CMPLX 0.24
+>       val -0.01 aro 0.40   ←
+```
+
+Island 0 is the **emotional peak** — LOVE and VOID both saturated,
+arousal up. That is where the field landed during the wounded /
+love-charged early prompts. Island 1 is the **softer settling** —
+half the LOVE, half the VOID, arousal cooled. The current pointer
+sits there. The trajectory between them is exactly the kind of
+"climate flow" phase4 bridges will track next step.
+
+The clustering is deliberately coarse (16 max, threshold 0.55)
+so islands stay meaningful — distinct emotional weather, not
+fine-grained per-slot tags.
+
++4 tests (112 total):
+
+- `leo_islands_assign: first soma slot seeds island 0`
+- `leo_islands_assign: close states join existing island`
+- `leo_islands_assign: far state seeds a new island`
+- `leo_islands_assign: centroid drifts toward new points`
+
+`./leo` standalone unchanged. The islands array sits zero in
+memory if no caller invokes `leo_islands_assign`. Optionality
+contract held.
+
+Next: **phase4 bridges** — transition graph A→B with metric
+deltas, bridge memory for similar past states, the climate-flow
+suggestions that close out the body-perception suite. Then
+hebbian consolidator with vendored notorch.
+
 ---
 
 ## What Leo said (selected)

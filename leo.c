@@ -122,6 +122,22 @@ static const char *LEO_EMBEDDED_BOOTSTRAP =
 #define LEO_MB_LR        0.05f      /* SGD learning rate */
 #define LEO_MB_NUDGE_MAX 0.20f      /* clamp for tau nudge advisor */
 
+/* Phase4 islands — state clustering on the soma stream.
+ *
+ * Not a planner. Memory of where the field usually flows. Each
+ * island is a stable region of inner state (chambers + valence +
+ * arousal); an incoming soma slot either joins the closest island
+ * (online EMA update of the centroid) or, if no island is close
+ * enough, becomes the seed of a new one. The current_island tag
+ * tells phase4 bridges (next step) which transitions to track.
+ *
+ *   "When life felt like this and passed through here, it often
+ *    flowed there." — legacy mathbrain_phase4 docstring.
+ */
+#define LEO_ISLAND_MAX     16
+#define LEO_ISLAND_DIM      8       /* chambers[6] + valence + arousal */
+#define LEO_ISLAND_THRESH   0.55f   /* distance under which a slot joins */
+
 /* Kuramoto-coupled emotional chambers — AML / paper Appendix B.
  * Six chambers live inside LeoField as a body-perception submodule. */
 #define LEO_N_CHAMBERS  6
@@ -749,6 +765,20 @@ typedef struct {
     uint8_t  _pad[7];                  /* explicit pad → stable on-disk size */
 } LeoSomaSlot;
 
+/* ─── LeoIsland: a stable region of inner state ───────────────────
+ *
+ * 8-dim centroid laid out as [chambers[6], valence, arousal]. Online
+ * EMA: when a soma slot joins, centroid moves a fraction of the way
+ * toward the new point; the fraction shrinks as count grows so old
+ * islands stabilise. POD layout for save/load. */
+typedef struct {
+    float    centroid[LEO_ISLAND_DIM];
+    int32_t  count;                   /* visits */
+    int64_t  last_step;               /* leo->step at most-recent visit */
+    int64_t  created_step;            /* when first formed */
+    uint8_t  _pad[8];                 /* explicit pad for stable on-disk size */
+} LeoIsland;
+
 /* ─── MathBrain: body-perception MLP, scalar autograd ──────────────
  *
  * 21 inputs (chambers[6] + soma blend[6] + soma velocity[6] +
@@ -857,6 +887,13 @@ typedef struct {
      * once (so even a freshly-loaded organism has a non-degenerate
      * forward pass) and trained by the leogo worker per reply-cycle. */
     MathBrain mathbrain;
+
+    /* Phase4 islands — clusters in the soma stream. Filled by the
+     * worker calling leo_islands_assign after each soma snapshot.
+     * Same opt-in contract: ./leo standalone never writes here. */
+    LeoIsland islands[LEO_ISLAND_MAX];
+    int32_t   n_islands;
+    int32_t   current_island;        /* -1 when no slot has been assigned */
 } LeoField;
 
 /* chamber decay rates (paper Appendix B.3): FEAR/LOVE/RAGE/VOID/FLOW/COMPLEX */
@@ -1076,6 +1113,9 @@ static void leo_field_init(LeoField *f, int vocab_cap) {
         }
         /* biases stay zero from memset */
     }
+
+    /* Islands start empty. -1 marks "no current island yet". */
+    f->current_island = -1;
 }
 
 static void leo_field_free(LeoField *f) {
@@ -1535,6 +1575,14 @@ int leo_save_state(const Leo *leo, const char *path) {
     write_i32(f, fld->mathbrain.train_count);
     write_f32(f, fld->mathbrain.running_loss);
 
+    /* Phase4 islands — same deal. Sentinels guard against future
+     * LEO_ISLAND_MAX or LEO_ISLAND_DIM changes. */
+    write_i32(f, LEO_ISLAND_MAX);
+    write_i32(f, LEO_ISLAND_DIM);
+    write_i32(f, fld->n_islands);
+    write_i32(f, fld->current_island);
+    fwrite(fld->islands, sizeof(LeoIsland), LEO_ISLAND_MAX, f);
+
     fclose(f);
     return 1;
 }
@@ -1705,6 +1753,30 @@ int leo_load_state(Leo *leo, const char *path) {
             /* On any mid-block failure, weights are partially over-
              * written but biases / counters keep their init values.
              * Acceptable: mathbrain is advisory, not load-bearing. */
+        }
+    }
+
+    /* Islands — best-effort. Sentinel mismatch leaves the buffer
+     * empty (n_islands stays 0 from leo_field_init). */
+    int32_t is_max = 0, is_dim = 0, is_n = 0, is_cur = 0;
+    if (read_i32(f, &is_max) &&
+        read_i32(f, &is_dim) &&
+        read_i32(f, &is_n)   &&
+        read_i32(f, &is_cur)) {
+        if (is_max == LEO_ISLAND_MAX &&
+            is_dim == LEO_ISLAND_DIM &&
+            is_n   >= 0 && is_n   <= LEO_ISLAND_MAX &&
+            is_cur >= -1 && is_cur < LEO_ISLAND_MAX) {
+            size_t got = fread(fld->islands, sizeof(LeoIsland),
+                               LEO_ISLAND_MAX, f);
+            if (got == (size_t)LEO_ISLAND_MAX) {
+                fld->n_islands      = is_n;
+                fld->current_island = is_cur;
+            } else {
+                memset(fld->islands, 0, sizeof(fld->islands));
+                fld->n_islands = 0;
+                fld->current_island = -1;
+            }
         }
     }
 
@@ -3683,6 +3755,116 @@ void leo_mathbrain_dump(const Leo *leo, FILE *out) {
     fprintf(out, "  predicted:    quality=%.2f\n", m->last_y);
     fprintf(out, "  advisor:      boredom=%.2f overwhelm=%.2f stuck=%.2f tau_nudge=%+.2f\n",
             m->boredom, m->overwhelm, m->stuck, m->tau_nudge);
+}
+
+/* ================================================================
+ * PHASE 4 — ISLANDS: state clustering on the soma stream.
+ *
+ * Online single-pass clustering. Each soma slot is a point in
+ * 8-D space (chambers[6] + valence + arousal); when one is taken,
+ * we compute Euclidean distance to every existing island centroid.
+ * Closest one within LEO_ISLAND_THRESH wins — its centroid drifts
+ * a fraction of the way toward the new point (1 / (count+1) — a
+ * proper running average) and count increments. Otherwise a new
+ * island is seeded with the slot as its first centroid. The
+ * buffer is capped at LEO_ISLAND_MAX; once full, the assign
+ * function picks the closest island even past threshold (graceful
+ * degrade: no new islands once we are full, just update existing).
+ *
+ * No planner. No transitions yet. Just the question "where in
+ * inner-state space am I right now?" with a stable answer.
+ * Phase 4 bridges (next step) will track A→B between these.
+ * ================================================================ */
+
+static void leo_islands_centroid_from_slot(const LeoSomaSlot *s,
+                                            float c[LEO_ISLAND_DIM]) {
+    for (int i = 0; i < LEO_N_CHAMBERS; i++) c[i] = s->chambers[i];
+    c[LEO_N_CHAMBERS + 0] = s->valence;
+    c[LEO_N_CHAMBERS + 1] = s->arousal;
+}
+
+static float leo_islands_distance(const float a[LEO_ISLAND_DIM],
+                                   const float b[LEO_ISLAND_DIM]) {
+    float ss = 0.0f;
+    for (int i = 0; i < LEO_ISLAND_DIM; i++) {
+        float d = a[i] - b[i];
+        ss += d * d;
+    }
+    return sqrtf(ss);
+}
+
+/* Assign the most-recent soma slot to an island (joining or
+ * creating). Returns the island index, or -1 on no-op (no soma
+ * slots present). The buffer is updated in place; current_island
+ * is set so phase4 bridges can read it next step. */
+int leo_islands_assign(Leo *leo) {
+    if (!leo) return -1;
+    LeoField *f = &leo->field;
+    if (f->soma_n <= 0) return -1;
+
+    int last = (f->soma_ptr - 1 + LEO_SOMA_SLOTS) % LEO_SOMA_SLOTS;
+    const LeoSomaSlot *slot = &f->soma[last];
+
+    float pt[LEO_ISLAND_DIM];
+    leo_islands_centroid_from_slot(slot, pt);
+
+    /* find closest existing island */
+    int best = -1;
+    float best_d = 1e9f;
+    for (int i = 0; i < f->n_islands; i++) {
+        float d = leo_islands_distance(pt, f->islands[i].centroid);
+        if (d < best_d) { best_d = d; best = i; }
+    }
+
+    /* join or create */
+    int idx;
+    if (best >= 0 &&
+        (best_d < LEO_ISLAND_THRESH || f->n_islands >= LEO_ISLAND_MAX)) {
+        /* online running-average update of the centroid */
+        LeoIsland *isl = &f->islands[best];
+        float w = 1.0f / (float)(isl->count + 1);
+        for (int i = 0; i < LEO_ISLAND_DIM; i++) {
+            isl->centroid[i] += w * (pt[i] - isl->centroid[i]);
+        }
+        isl->count++;
+        isl->last_step = (int64_t)leo->step;
+        idx = best;
+    } else {
+        /* seed a new island with this point */
+        idx = f->n_islands;
+        LeoIsland *isl = &f->islands[idx];
+        memset(isl, 0, sizeof(*isl));
+        memcpy(isl->centroid, pt, sizeof(pt));
+        isl->count = 1;
+        isl->created_step = (int64_t)leo->step;
+        isl->last_step    = (int64_t)leo->step;
+        f->n_islands++;
+    }
+    f->current_island = idx;
+    return idx;
+}
+
+void leo_islands_dump(const Leo *leo, FILE *out) {
+    if (!leo || !out) return;
+    const LeoField *f = &leo->field;
+    fprintf(out, "  islands:     %d/%d (current=%d)\n",
+            f->n_islands, LEO_ISLAND_MAX, f->current_island);
+    for (int i = 0; i < f->n_islands; i++) {
+        const LeoIsland *isl = &f->islands[i];
+        fprintf(out, "    [%d] count=%d last_step=%lld   "
+                     "FEAR%.2f LOVE%.2f RAGE%.2f VOID%.2f FLOW%.2f CMPLX%.2f "
+                     "val%+.2f aro%.2f%s\n",
+                i, isl->count, (long long)isl->last_step,
+                isl->centroid[LEO_CH_FEAR],
+                isl->centroid[LEO_CH_LOVE],
+                isl->centroid[LEO_CH_RAGE],
+                isl->centroid[LEO_CH_VOID],
+                isl->centroid[LEO_CH_FLOW],
+                isl->centroid[LEO_CH_COMPLEX],
+                isl->centroid[LEO_N_CHAMBERS + 0],
+                isl->centroid[LEO_N_CHAMBERS + 1],
+                (i == f->current_island) ? "  ←" : "");
+    }
 }
 
 #ifndef LEO_LIB

@@ -298,6 +298,12 @@ func workerLoop(leo *LeoGo, meta *MetaLeo, ch <-chan RingRequest, wg *sync.WaitG
 		// and is consumed by the next cycle's rings.
 		quality := score(req.Reply)
 		leo.MathbrainStep(quality)
+
+		// Phase4 islands — cluster the just-stored soma slot.
+		// Joins the closest island (centroid drifts toward the
+		// new point) or seeds a new one if no island is close.
+		// Phase4 bridges (next step) will track A→B transitions.
+		leo.IslandsAssign()
 	}
 }
 

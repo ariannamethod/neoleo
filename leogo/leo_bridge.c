@@ -155,3 +155,25 @@ int leo_bridge_mathbrain_train_count(void *ptr) {
     if (!ptr) return 0;
     return ((const Leo *)ptr)->field.mathbrain.train_count;
 }
+
+/* ---- phase4 islands --------------------------------------------- */
+
+int leo_bridge_islands_assign(void *ptr) {
+    if (!ptr) return -1;
+    return leo_islands_assign((Leo *)ptr);
+}
+
+int leo_bridge_islands_n(void *ptr) {
+    if (!ptr) return 0;
+    return ((const Leo *)ptr)->field.n_islands;
+}
+
+int leo_bridge_islands_current(void *ptr) {
+    if (!ptr) return -1;
+    return ((const Leo *)ptr)->field.current_island;
+}
+
+void leo_bridge_islands_dump(void *ptr) {
+    if (!ptr) return;
+    leo_islands_dump((const Leo *)ptr, stdout);
+}

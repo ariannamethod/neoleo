@@ -45,6 +45,11 @@ extern float leo_bridge_mathbrain_step(void *, float);
 extern float leo_bridge_mathbrain_tau_nudge(void *);
 extern void  leo_bridge_mathbrain_dump(void *);
 extern int   leo_bridge_mathbrain_train_count(void *);
+
+extern int   leo_bridge_islands_assign(void *);
+extern int   leo_bridge_islands_n(void *);
+extern int   leo_bridge_islands_current(void *);
+extern void  leo_bridge_islands_dump(void *);
 */
 import "C"
 
@@ -288,6 +293,37 @@ func (lg *LeoGo) MathbrainTrainCount() int {
 	lg.mu.RLock()
 	defer lg.mu.RUnlock()
 	return int(C.leo_bridge_mathbrain_train_count(lg.ptr))
+}
+
+// ---- phase4 islands ----------------------------------------------
+//
+// Islands cluster the soma stream — "where in inner-state space am
+// I right now?" with a stable answer. Filled by the worker calling
+// IslandsAssign after each soma snapshot. Phase4 bridges (next step)
+// will track A→B transitions on top of these.
+
+func (lg *LeoGo) IslandsAssign() int {
+	lg.mu.Lock()
+	defer lg.mu.Unlock()
+	return int(C.leo_bridge_islands_assign(lg.ptr))
+}
+
+func (lg *LeoGo) IslandsN() int {
+	lg.mu.RLock()
+	defer lg.mu.RUnlock()
+	return int(C.leo_bridge_islands_n(lg.ptr))
+}
+
+func (lg *LeoGo) IslandsCurrent() int {
+	lg.mu.RLock()
+	defer lg.mu.RUnlock()
+	return int(C.leo_bridge_islands_current(lg.ptr))
+}
+
+func (lg *LeoGo) IslandsDump() {
+	lg.mu.RLock()
+	defer lg.mu.RUnlock()
+	C.leo_bridge_islands_dump(lg.ptr)
 }
 
 // BootstrapFragment returns a random sentence from the embedded
