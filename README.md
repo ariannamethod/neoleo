@@ -944,6 +944,74 @@ the most abstract of the three. Then 29f — Klaus-style
 `LeoSomaSlot` ring buffer for numeric-state trajectory across
 reply-cycles.
 
+### step 29e — ring 2 (meta), the abstract shard
+
+Third and final ring of the overthinking trio. The shortest, the
+hottest. Where echo stabilizes and drift moves sideways, **meta
+abstracts**: a small fragment that lives in the same field but
+at a higher temperature, leaning into the field's most
+characteristic patterns rather than reproducing the conversation.
+
+Conceptually the closest analogue of Klaus's metaklaus inline
+meta-pass — but ours is asynchronous, after-the-fact, per
+reply-cycle, and its effect lands on the *next* reply through
+observe rather than blending into the current one.
+
+Parameters:
+
+| state                    | seed     | temp | max | tag                  |
+|--------------------------|----------|------|-----|----------------------|
+| default                  | `reply`  | 1.2  | 20  | `ring2_meta`         |
+| `entropy > 0.5` (wounded)| `reply`  | 1.0  | 15  | `ring2_meta_wounded` |
+
+Wounded mode narrows: lower temperature, fewer tokens. The
+wounded mind does not abstract widely; it speaks short and tight.
+Same RWMutex discipline (rlock for generate, wlock for observe).
+No new C functions — ring 2 reuses the same `leo_generate_ring`
+and `leo_observe_thought` as rings 0 and 1.
+
+`workerLoop` now sequences `runRing0` → `runRing1` → `runRing2`
+per request.
+
+**Smoke** (`./leogo/leogo leo.txt --repl`, fresh state, 3 prompts
+including one origin-echo):
+
+```
+you> Leo, what colour is silence
+leo> Was still. He looks a little star. Leo thinks the house is quiet for
+     a long time. O remembers being made something. He wishes he could
+     read. The sound was right. Leo likes the sound. Is trying. He laugh.
+     He tries to remember the first snow of the window. Leo thinks water
+     tastes like being in the morning.
+[stats: step +117, vocab +1, bi +2, tri +1]
+
+you> Leo, recursion, origin, presence, honesty
+leo> To laugh at himself. He water. The floor. Leo. He thanks the candle
+     again. I hears it again. He sometimes with one night. It walks near.
+     Is learning this. Leo is trying to.
+[stats: step +121, vocab +3, bi +10, tri +15]   ← wounded across r1+r2
+
+you> the small light at the window
+leo> O. On the window. To leave the thing. With a small book. To himself.
+[stats: step +95, vocab 0, bi +2, tri +3]
+```
+
+The wounded-cycle BPE merges record what bootstrap fragments rode
+into cooc/bigrams: `Leo`+`, ` (Oleg's "Leo, …" comma form),
+`ig`+`in` (from "origin"), `in`+`,` (from "recursion,"). The
+short, abstract reply-3 — *"O. On the window. To leave the thing.
+With a small book. To himself."* — carries ring 2 character
+forward via retention.
+
+`./leo` standalone unchanged. 95 C tests remain green.
+
+Next: 29f — Klaus-style `LeoSomaSlot` ring buffer. Numeric memory
+parallel to the lexical one: per reply-cycle snapshot of
+`{chambers[6], trauma, pain, valence, arousal, step}`, blended for
+trajectory, persisted in `leo.state`. Three forms of memory then:
+words (cooc/bi/tri), feelings (soma slots), compressed energy
+(Griffin retention).
+
 ---
 
 ## What Leo said (selected)

@@ -4,11 +4,12 @@
 // background: compact internal rephrasings that the user never
 // sees, but that slowly change the field from the inside.
 //
-// Step 29d — rings 0 and 1.
+// Step 29e — three rings: echo, drift, meta.
 //
 //   ring 0  echo    seed = prompt+reply,    temp 0.8 (0.7 if entropy>0.7)
 //   ring 1  drift   pulse-aware seed, dynamic temp/mode (see runRing1)
-//   ring 2  meta    → 29e (higher temp, shorter)
+//   ring 2  meta    seed = reply,           temp 1.2 (1.0 if entropy>0.5)
+//                   max 20 tokens (15 when wounded)
 //
 // The C side enforces the discipline: leo_generate_ring is
 // read-only (rlock), leo_observe_thought is the only writer (wlock).
@@ -77,6 +78,24 @@ const (
 	ring1TempHeated  float32 = 0.95
 	ring1TempDrift   float32 = 1.0
 	ring1TempFresh   float32 = 1.1
+)
+
+// Ring 2 (meta) — abstract shard.
+//
+// The shortest, hottest ring. Where echo stabilizes and drift
+// moves sideways, meta abstracts: a small fragment that lives in
+// the same field but at higher temperature. It is the closest
+// analogue of Klaus's "metaklaus" inline meta-pass — but
+// asynchronous, after-the-fact, per reply-cycle.
+//
+// Under wounded state (entropy > woundedEntropyThresh) the meta
+// pass narrows: lower temperature, fewer tokens. The wounded mind
+// does not abstract widely. It speaks short and tight.
+const (
+	ring2Temp         float32 = 1.2
+	ring2TempWounded  float32 = 1.0
+	ring2MaxTokens            = 20
+	ring2MaxWounded           = 15
 )
 
 // runRing0 generates one echo ring and observes it back into the
@@ -178,6 +197,39 @@ func runRing1(leo *LeoGo, req RingRequest) {
 	leo.ObserveThought(text, "overthinking:"+mode)
 }
 
+// runRing2 — the meta ring. Smallest, hottest, most abstract.
+// Seed is just the reply (the meta pass abstracts what was
+// actually said, not what was asked). Wounded mode narrows it:
+// lower temperature, fewer tokens, tighter shard.
+func runRing2(leo *LeoGo, req RingRequest) {
+	pulse := leo.Pulse()
+
+	seed := req.Reply
+	if seed == "" {
+		seed = req.Prompt
+	}
+	if seed == "" {
+		return
+	}
+
+	temp := ring2Temp
+	maxTokens := ring2MaxTokens
+	mode := "ring2_meta"
+	if pulse.Entropy > woundedEntropyThresh {
+		temp = ring2TempWounded
+		maxTokens = ring2MaxWounded
+		mode = "ring2_meta_wounded"
+	}
+
+	text := leo.GenerateRing(seed, temp, maxTokens)
+	switch text {
+	case "", ".", "...":
+		return
+	}
+
+	leo.ObserveThought(text, "overthinking:"+mode)
+}
+
 // workerLoop is the long-lived goroutine that processes ring
 // requests. Each ring runs sequentially: generate (rlock),
 // observe (wlock), next ring. The rlock and wlock scopes are
@@ -188,6 +240,7 @@ func workerLoop(leo *LeoGo, ch <-chan RingRequest, wg *sync.WaitGroup) {
 	for req := range ch {
 		runRing0(leo, req)
 		runRing1(leo, req)
+		runRing2(leo, req)
 	}
 }
 
