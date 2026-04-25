@@ -177,3 +177,20 @@ void leo_bridge_islands_dump(void *ptr) {
     if (!ptr) return;
     leo_islands_dump((const Leo *)ptr, stdout);
 }
+
+/* ---- phase4 bridges --------------------------------------------- */
+
+int leo_bridge_bridges_record(void *ptr) {
+    if (!ptr) return -1;
+    return leo_bridges_record((Leo *)ptr);
+}
+
+int leo_bridge_bridges_n(void *ptr) {
+    if (!ptr) return 0;
+    return ((const Leo *)ptr)->field.n_transitions;
+}
+
+void leo_bridge_bridges_dump(void *ptr) {
+    if (!ptr) return;
+    leo_bridges_dump((const Leo *)ptr, stdout);
+}

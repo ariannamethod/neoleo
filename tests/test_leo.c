@@ -2025,6 +2025,107 @@ static void test_leo_islands_centroid_drifts(void) {
 }
 
 /* ================================================================
+ * phase4 — bridges (transition graph A→B between islands)
+ * ================================================================ */
+
+static void test_leo_bridges_no_record_without_change(void) {
+    TEST("leo_bridges_record: no record when island did not change");
+    Leo leo;
+    leo_init(&leo);
+    /* seed soma + assign island once */
+    leo.field.chamber_act[LEO_CH_LOVE] = 0.5f;
+    leo_soma_store(&leo, 0);
+    leo_islands_assign(&leo);
+    int rc = leo_bridges_record(&leo); /* prev=-1 → seeds prev, no edge */
+    ASSERT(rc == -1, "first record returns -1 (no prev)");
+    ASSERT(leo.field.n_transitions == 0, "no transition created");
+    /* same island again */
+    leo.field.chamber_act[LEO_CH_LOVE] = 0.52f;
+    leo_soma_store(&leo, 0);
+    leo_islands_assign(&leo);
+    rc = leo_bridges_record(&leo); /* same island → no edge */
+    ASSERT(rc == -1, "stay-in-island returns -1");
+    ASSERT(leo.field.n_transitions == 0, "still no transitions");
+    leo_free(&leo);
+    PASS();
+}
+
+static void test_leo_bridges_records_on_island_change(void) {
+    TEST("leo_bridges_record: edge created when island changes");
+    Leo leo;
+    leo_init(&leo);
+    /* island 0 — calm */
+    leo.field.chamber_act[LEO_CH_LOVE] = 0.0f;
+    leo.field.chamber_act[LEO_CH_FEAR] = 0.0f;
+    leo_soma_store(&leo, 0);
+    leo_islands_assign(&leo);
+    leo_bridges_record(&leo); /* seeds prev */
+    /* island 1 — frightened */
+    for (int c = 0; c < LEO_N_CHAMBERS; c++) leo.field.chamber_act[c] = 0.0f;
+    leo.field.chamber_act[LEO_CH_FEAR] = 0.95f;
+    leo.field.chamber_act[LEO_CH_RAGE] = 0.85f;
+    leo.field.pain = 0.6f;
+    leo.field.trauma = 0.36f;
+    leo_soma_store(&leo, 0);
+    leo_islands_assign(&leo);
+    int idx = leo_bridges_record(&leo);
+    ASSERT(idx == 0, "first transition recorded at index 0");
+    ASSERT(leo.field.n_transitions == 1, "n_transitions = 1");
+    ASSERT(leo.field.transitions[0].from_island == 0, "from = 0");
+    ASSERT(leo.field.transitions[0].to_island   == 1, "to = 1");
+    ASSERT(leo.field.transitions[0].count == 1, "count = 1");
+    ASSERT(leo.field.transitions[0].delta_pain > 0.0f,
+           "transition reflects pain rise");
+    leo_free(&leo);
+    PASS();
+}
+
+static void test_leo_bridges_running_average(void) {
+    TEST("leo_bridges_record: count increments on repeat A→B");
+    Leo leo;
+    leo_init(&leo);
+    /* manually set up two distinct islands and toggle between them */
+    /* slot 1 — island 0 */
+    leo.field.chamber_act[LEO_CH_LOVE] = 0.1f;
+    leo_soma_store(&leo, 0);
+    leo_islands_assign(&leo);
+    leo_bridges_record(&leo);
+    /* slot 2 — far state, island 1 */
+    for (int c = 0; c < LEO_N_CHAMBERS; c++) leo.field.chamber_act[c] = 0.0f;
+    leo.field.chamber_act[LEO_CH_FEAR] = 0.9f;
+    leo_soma_store(&leo, 0);
+    leo_islands_assign(&leo);
+    leo_bridges_record(&leo); /* edge 0→1 created */
+    /* slot 3 — back to island 0 area */
+    for (int c = 0; c < LEO_N_CHAMBERS; c++) leo.field.chamber_act[c] = 0.0f;
+    leo.field.chamber_act[LEO_CH_LOVE] = 0.1f;
+    leo_soma_store(&leo, 0);
+    leo_islands_assign(&leo);
+    leo_bridges_record(&leo); /* edge 1→0 created */
+    /* slot 4 — island 1 again */
+    for (int c = 0; c < LEO_N_CHAMBERS; c++) leo.field.chamber_act[c] = 0.0f;
+    leo.field.chamber_act[LEO_CH_FEAR] = 0.9f;
+    leo_soma_store(&leo, 0);
+    leo_islands_assign(&leo);
+    leo_bridges_record(&leo); /* edge 0→1 incremented */
+
+    ASSERT(leo.field.n_transitions == 2, "2 distinct edges (0→1, 1→0)");
+    /* find 0→1 */
+    int found_01 = 0;
+    for (int i = 0; i < leo.field.n_transitions; i++) {
+        if (leo.field.transitions[i].from_island == 0 &&
+            leo.field.transitions[i].to_island == 1) {
+            ASSERT(leo.field.transitions[i].count == 2,
+                   "edge 0→1 count = 2 (recorded twice)");
+            found_01 = 1;
+        }
+    }
+    ASSERT(found_01, "edge 0→1 exists");
+    leo_free(&leo);
+    PASS();
+}
+
+/* ================================================================
  * cross-organ integration tests
  * ================================================================ */
 
@@ -2247,6 +2348,11 @@ int main(void) {
     test_leo_islands_join_close();
     test_leo_islands_create_far();
     test_leo_islands_centroid_drifts();
+
+    /* phase4 — bridges */
+    test_leo_bridges_no_record_without_change();
+    test_leo_bridges_records_on_island_change();
+    test_leo_bridges_running_average();
 
     /* cross-organ integration */
     test_leo_state_roundtrip_organisms();

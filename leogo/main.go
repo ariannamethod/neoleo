@@ -143,7 +143,7 @@ func main() {
 
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 1<<20), 1<<20)
-	fmt.Println("> type prompts; 'quit' to exit; '/stats' counters; '/soma' mood; '/meta' inner voice; '/math' body advisor; '/islands' state clusters; '/save' persist")
+	fmt.Println("> type prompts; 'quit' to exit; '/stats' '/soma' '/meta' '/math' '/islands' '/bridges' '/save'")
 	for {
 		fmt.Print("\nyou> ")
 		if !scanner.Scan() {
@@ -174,6 +174,9 @@ func main() {
 			continue
 		case "/islands":
 			leo.IslandsDump()
+			continue
+		case "/bridges":
+			leo.BridgesDump()
 			continue
 		case "/save":
 			if leo.Save(statePath) {

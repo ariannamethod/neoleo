@@ -50,6 +50,10 @@ extern int   leo_bridge_islands_assign(void *);
 extern int   leo_bridge_islands_n(void *);
 extern int   leo_bridge_islands_current(void *);
 extern void  leo_bridge_islands_dump(void *);
+
+extern int   leo_bridge_bridges_record(void *);
+extern int   leo_bridge_bridges_n(void *);
+extern void  leo_bridge_bridges_dump(void *);
 */
 import "C"
 
@@ -324,6 +328,31 @@ func (lg *LeoGo) IslandsDump() {
 	lg.mu.RLock()
 	defer lg.mu.RUnlock()
 	C.leo_bridge_islands_dump(lg.ptr)
+}
+
+// ---- phase4 bridges ----------------------------------------------
+//
+// Bridges record island-to-island transitions. The worker calls
+// BridgesRecord after IslandsAssign — it is a no-op when the island
+// did not change. Pure recording: phase4 advisor (later step) will
+// read the transition graph for "where the field tends to flow".
+
+func (lg *LeoGo) BridgesRecord() int {
+	lg.mu.Lock()
+	defer lg.mu.Unlock()
+	return int(C.leo_bridge_bridges_record(lg.ptr))
+}
+
+func (lg *LeoGo) BridgesN() int {
+	lg.mu.RLock()
+	defer lg.mu.RUnlock()
+	return int(C.leo_bridge_bridges_n(lg.ptr))
+}
+
+func (lg *LeoGo) BridgesDump() {
+	lg.mu.RLock()
+	defer lg.mu.RUnlock()
+	C.leo_bridge_bridges_dump(lg.ptr)
 }
 
 // BootstrapFragment returns a random sentence from the embedded

@@ -138,6 +138,22 @@ static const char *LEO_EMBEDDED_BOOTSTRAP =
 #define LEO_ISLAND_DIM      8       /* chambers[6] + valence + arousal */
 #define LEO_ISLAND_THRESH   0.55f   /* distance under which a slot joins */
 
+/* Phase4 bridges — transition graph A→B between islands.
+ *
+ * Not a planner. Memory of which island sequences naturally
+ * occur and what mood-deltas they carried. With ≤16 islands the
+ * pair-space is ≤256, but in practice <50 are ever active, so a
+ * flat array with linear-scan upsert beats a hash table on both
+ * code size and persistence simplicity.
+ *
+ * Recorded by the leogo worker after each islands_assign, only
+ * when current_island differs from the previous one — so a
+ * "stay in same island" cycle is not noise on the transition
+ * graph. Phase4 advisor (next step or later, on top of mathbrain)
+ * will use this to suggest "where the field tends to flow
+ * after here". */
+#define LEO_TRANS_MAX 64
+
 /* Kuramoto-coupled emotional chambers — AML / paper Appendix B.
  * Six chambers live inside LeoField as a body-perception submodule. */
 #define LEO_N_CHAMBERS  6
@@ -779,6 +795,25 @@ typedef struct {
     uint8_t  _pad[8];                 /* explicit pad for stable on-disk size */
 } LeoIsland;
 
+/* ─── LeoTransition: one A→B edge in the island graph ──────────────
+ *
+ * Running averages of mood-deltas across all observed transitions
+ * from from_island to to_island. count is the number of times the
+ * transition was recorded. Risk shows up as positive delta_pain or
+ * delta_trauma — visible in /bridges, not yet acted on. */
+typedef struct {
+    int8_t   from_island;
+    int8_t   to_island;
+    uint8_t  _pad0[2];
+    int32_t  count;
+    float    delta_chambers[LEO_N_CHAMBERS];
+    float    delta_valence;
+    float    delta_arousal;
+    float    delta_trauma;
+    float    delta_pain;
+    int64_t  last_step;
+} LeoTransition;
+
 /* ─── MathBrain: body-perception MLP, scalar autograd ──────────────
  *
  * 21 inputs (chambers[6] + soma blend[6] + soma velocity[6] +
@@ -894,6 +929,14 @@ typedef struct {
     LeoIsland islands[LEO_ISLAND_MAX];
     int32_t   n_islands;
     int32_t   current_island;        /* -1 when no slot has been assigned */
+
+    /* Phase4 bridges — A→B transition graph between islands.
+     * Recorded by leo_bridges_record (called by the worker after
+     * islands_assign) only when current_island changes. prev_island
+     * tracks the source for the next recording. */
+    LeoTransition transitions[LEO_TRANS_MAX];
+    int32_t       n_transitions;
+    int32_t       prev_island;        /* -1 until first recording */
 } LeoField;
 
 /* chamber decay rates (paper Appendix B.3): FEAR/LOVE/RAGE/VOID/FLOW/COMPLEX */
@@ -1116,6 +1159,10 @@ static void leo_field_init(LeoField *f, int vocab_cap) {
 
     /* Islands start empty. -1 marks "no current island yet". */
     f->current_island = -1;
+
+    /* Bridges start empty too. prev_island = -1 means the first
+     * recording call will simply seed prev and skip emit. */
+    f->prev_island = -1;
 }
 
 static void leo_field_free(LeoField *f) {
@@ -1583,6 +1630,13 @@ int leo_save_state(const Leo *leo, const char *path) {
     write_i32(f, fld->current_island);
     fwrite(fld->islands, sizeof(LeoIsland), LEO_ISLAND_MAX, f);
 
+    /* Phase4 bridges — transitions + n_transitions + prev_island.
+     * Sentinel LEO_TRANS_MAX guards future capacity bumps. */
+    write_i32(f, LEO_TRANS_MAX);
+    write_i32(f, fld->n_transitions);
+    write_i32(f, fld->prev_island);
+    fwrite(fld->transitions, sizeof(LeoTransition), LEO_TRANS_MAX, f);
+
     fclose(f);
     return 1;
 }
@@ -1776,6 +1830,28 @@ int leo_load_state(Leo *leo, const char *path) {
                 memset(fld->islands, 0, sizeof(fld->islands));
                 fld->n_islands = 0;
                 fld->current_island = -1;
+            }
+        }
+    }
+
+    /* Bridges — same best-effort pattern. Sentinel mismatch leaves
+     * the buffer empty (n_transitions = 0, prev_island = -1). */
+    int32_t tr_max = 0, tr_n = 0, tr_prev = 0;
+    if (read_i32(f, &tr_max) &&
+        read_i32(f, &tr_n)   &&
+        read_i32(f, &tr_prev)) {
+        if (tr_max == LEO_TRANS_MAX &&
+            tr_n   >= 0 && tr_n   <= LEO_TRANS_MAX &&
+            tr_prev >= -1 && tr_prev < LEO_ISLAND_MAX) {
+            size_t got = fread(fld->transitions, sizeof(LeoTransition),
+                               LEO_TRANS_MAX, f);
+            if (got == (size_t)LEO_TRANS_MAX) {
+                fld->n_transitions = tr_n;
+                fld->prev_island   = tr_prev;
+            } else {
+                memset(fld->transitions, 0, sizeof(fld->transitions));
+                fld->n_transitions = 0;
+                fld->prev_island = -1;
             }
         }
     }
@@ -3864,6 +3940,145 @@ void leo_islands_dump(const Leo *leo, FILE *out) {
                 isl->centroid[LEO_N_CHAMBERS + 0],
                 isl->centroid[LEO_N_CHAMBERS + 1],
                 (i == f->current_island) ? "  ←" : "");
+    }
+}
+
+/* ================================================================
+ * PHASE 4 — BRIDGES: transition graph A→B between islands.
+ *
+ * Recorded after each islands_assign call, but only when
+ * current_island differs from the previous one — staying in the
+ * same island is not a transition. The metric deltas are taken
+ * between the two most-recent soma slots (which is the same
+ * lookback the islands themselves used).
+ *
+ * Linear-scan upsert: with at most 16 islands the pair-space is
+ * 256, but real conversations populate <50; a flat array keeps
+ * the data compact, easy to persist, and easy to inspect.
+ *
+ * Phase4 bridges are pure recording for now — no advisor on top.
+ * The numbers are visible through /bridges and through the
+ * mathbrain phase4 layer that may wrap them in a later step.
+ * ================================================================ */
+
+static int leo_bridges_find(const LeoField *f, int from_isl, int to_isl) {
+    for (int i = 0; i < f->n_transitions; i++) {
+        if (f->transitions[i].from_island == (int8_t)from_isl &&
+            f->transitions[i].to_island   == (int8_t)to_isl) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* Record a transition prev_island → current_island, taking metric
+ * deltas from the two most-recent soma slots. No-op when:
+ *   - no current island
+ *   - no previous island (first call after init/load)
+ *   - prev_island == current_island (no transition)
+ *   - fewer than 2 soma slots (no delta to compute)
+ *   - the buffer is full and the pair is new (silent drop). */
+int leo_bridges_record(Leo *leo) {
+    if (!leo) return -1;
+    LeoField *f = &leo->field;
+
+    int curr = f->current_island;
+    int prev = f->prev_island;
+
+    /* always update prev to curr at function end so the next call
+     * has a fresh source even if we no-op'd this round. */
+    if (curr < 0) return -1;
+    if (prev < 0)        { f->prev_island = curr; return -1; }
+    if (prev == curr)    { f->prev_island = curr; return -1; }
+    if (f->soma_n < 2)   { f->prev_island = curr; return -1; }
+
+    int i_now  = (f->soma_ptr - 1 + LEO_SOMA_SLOTS) % LEO_SOMA_SLOTS;
+    int i_prev = (f->soma_ptr - 2 + LEO_SOMA_SLOTS) % LEO_SOMA_SLOTS;
+    const LeoSomaSlot *s_prev = &f->soma[i_prev];
+    const LeoSomaSlot *s_now  = &f->soma[i_now];
+
+    int idx = leo_bridges_find(f, prev, curr);
+    if (idx < 0) {
+        if (f->n_transitions >= LEO_TRANS_MAX) {
+            f->prev_island = curr;
+            return -1;
+        }
+        idx = f->n_transitions++;
+        LeoTransition *t = &f->transitions[idx];
+        memset(t, 0, sizeof(*t));
+        t->from_island = (int8_t)prev;
+        t->to_island   = (int8_t)curr;
+    }
+
+    LeoTransition *t = &f->transitions[idx];
+    /* online running-average update (Welford-style; equivalent for
+     * the simple mean we keep here). count grows first so the
+     * weight of the newest delta is 1/(new count). */
+    int n = ++t->count;
+    float w = 1.0f / (float)n;
+    for (int c = 0; c < LEO_N_CHAMBERS; c++) {
+        float d = s_now->chambers[c] - s_prev->chambers[c];
+        t->delta_chambers[c] += w * (d - t->delta_chambers[c]);
+    }
+    {
+        float dv = s_now->valence - s_prev->valence;
+        t->delta_valence += w * (dv - t->delta_valence);
+        float da = s_now->arousal - s_prev->arousal;
+        t->delta_arousal += w * (da - t->delta_arousal);
+        float dt = s_now->trauma - s_prev->trauma;
+        t->delta_trauma += w * (dt - t->delta_trauma);
+        float dp = s_now->pain - s_prev->pain;
+        t->delta_pain += w * (dp - t->delta_pain);
+    }
+    t->last_step = (int64_t)leo->step;
+
+    f->prev_island = curr;
+    return idx;
+}
+
+/* Top outgoing transitions from `from_island`, sorted by count
+ * descending. Writes up to `k` indices into out_indices and
+ * returns how many were filled. Pure read-only — used by future
+ * advisor / phase4 mathbrain. */
+int leo_bridges_top_outgoing(const Leo *leo, int from_island,
+                              int *out_indices, int k) {
+    if (!leo || !out_indices || k <= 0) return 0;
+    const LeoField *f = &leo->field;
+
+    int n = 0;
+    for (int i = 0; i < f->n_transitions && n < k; i++) {
+        if (f->transitions[i].from_island != (int8_t)from_island) continue;
+        /* insertion sort by count descending */
+        int j = n - 1;
+        while (j >= 0 &&
+               f->transitions[out_indices[j]].count <
+               f->transitions[i].count) {
+            if (j + 1 < k) out_indices[j + 1] = out_indices[j];
+            j--;
+        }
+        if (j + 1 < k) out_indices[j + 1] = i;
+        n++;
+        if (n > k) n = k;
+    }
+    return n;
+}
+
+void leo_bridges_dump(const Leo *leo, FILE *out) {
+    if (!leo || !out) return;
+    const LeoField *f = &leo->field;
+    fprintf(out, "  bridges:     %d/%d (prev=%d, curr=%d)\n",
+            f->n_transitions, LEO_TRANS_MAX,
+            f->prev_island, f->current_island);
+    for (int i = 0; i < f->n_transitions; i++) {
+        const LeoTransition *t = &f->transitions[i];
+        const char *risk = (t->delta_pain > 0.05f) ? "  ⚠pain"
+                         : (t->delta_pain < -0.05f) ? "  ✓relief"
+                         : "";
+        fprintf(out, "    %d→%d count=%d  Δval%+.2f Δaro%+.2f "
+                     "Δtrauma%+.2f Δpain%+.2f%s\n",
+                t->from_island, t->to_island, t->count,
+                t->delta_valence, t->delta_arousal,
+                t->delta_trauma, t->delta_pain, risk);
     }
 }
 

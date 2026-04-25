@@ -1787,6 +1787,152 @@ deltas, bridge memory for similar past states, the climate-flow
 suggestions that close out the body-perception suite. Then
 hebbian consolidator with vendored notorch.
 
+### step 36 — phase4 bridges: transition graph between islands
+
+Bridges are A→B edges between islands with running averages of
+mood-deltas — *"when the field passed from here to there, what
+did it feel like along the way?"* Pure recording at this step,
+no advisor on top yet. The numbers are visible through `/bridges`
+and stand ready for a phase4 mathbrain advisor to consume.
+
+**Reframing the legacy design.** Legacy phase4_bridges.py had
+`Episode` / `EpisodeStep` / `EpisodeLogger` / `BridgeMemory`
+with `Dict[(A,B)] → TransitionStat` and `metrics_similarity` for
+candidate retrieval. We dropped most of it deliberately:
+
+- **Episodes are implicit.** Soma slots are already steps; there
+  is no separate logger. Each `SomaSnapshot + IslandsAssign`
+  pair is one legacy `EpisodeStep`.
+- **TransitionGraph is a flat array, not a hash map.** With
+  ≤ 16 islands the pair-space is ≤ 256, in practice <50 active.
+  Linear scan upserts; POD struct persists trivially in
+  `leo.state`.
+- **Metric deltas use the fixed pulse, not an open dict.** The
+  legacy `Metrics` was `Dict[str, float]` because Python; we
+  type the deltas exactly: `Δchambers[6]`, `Δvalence`,
+  `Δarousal`, `Δtrauma`, `Δpain`. No string keys.
+- **`BridgeMemory.collect_candidates` deferred.** Similarity
+  matching for "find similar past states" is advisor logic,
+  not recording. It belongs in a later step that wraps phase4
+  output into mathbrain's MultiLeo or its own organ.
+- **All in C, like the rest of the body-perception suite.** No
+  Go-side mirror state.
+
+C addition — `LeoTransition` POD + a 64-edge array on `LeoField`:
+
+```c
+typedef struct {
+    int8_t   from_island;
+    int8_t   to_island;
+    uint8_t  _pad0[2];
+    int32_t  count;
+    float    delta_chambers[6];
+    float    delta_valence;
+    float    delta_arousal;
+    float    delta_trauma;
+    float    delta_pain;
+    int64_t  last_step;
+} LeoTransition;
+```
+
+Functions:
+
+- `leo_bridges_record(leo)` — called by the worker after
+  `leo_islands_assign`. Records `prev_island → current_island`
+  with metric deltas pulled from the two most-recent soma slots,
+  using a running-average update on the existing edge or
+  creating a new one. **No-op when:** no current island, no
+  previous island (first call), island unchanged (a stay), fewer
+  than 2 soma slots, or the buffer is full and the pair is new.
+  `prev_island` is bumped to `current_island` even on no-op so
+  the next call starts from the right source.
+- `leo_bridges_top_outgoing(leo, from, out, k)` — top-K outgoing
+  edges sorted by count, ready for an advisor to consume. Pure
+  read-only.
+- `leo_bridges_dump` — table with from / to / count / Δval /
+  Δaro / Δtrauma / Δpain plus a tiny `⚠pain` or `✓relief` tag
+  next to edges with notable pain motion.
+
+Persistence: appended to `leo.state` after the islands block,
+sentinel `LEO_TRANS_MAX` guards against future capacity bumps.
+Old state files load with empty bridges (`n_transitions = 0`,
+`prev_island = -1`).
+
+**Worker integration** — `workerLoop` order updates:
+
+```
+runRing0 / runRing1 / runRing2  → observe
+metaleo.Process                  → maybe override-observe
+SomaSnapshot                     → store one slot
+MathbrainStep                    → forward + train + advisor
+IslandsAssign                    → cluster the slot
+BridgesRecord                    → A→B edge if island changed
+```
+
+REPL gets `/bridges`.
+
+**Smoke** — 5 prompts deliberately alternating calm / wounded /
+calm to force island changes (`./leogo/leogo leo.txt --repl`,
+fresh state, 4 s gaps so the worker drains every cycle):
+
+```
+prompts:
+  1. the rain is small                                    (calm)
+  2. Leo, recursion, origin, presence, honesty, trauma    (wounded)
+  3. the morning is gentle and small                      (calm)
+  4. Leo, the cat is watching from the closet, fear       (peak)
+  5. the rain on the window is soft                       (recovery)
+
+/islands → 5/16 (current=4)
+  [0] FEAR 0.21 LOVE 0.50 VOID 0.76 CMPLX 0.70  val-0.28 aro 0.93
+  [1] FEAR 0.56 LOVE 0.69 VOID 0.68 CMPLX 0.18  val-0.48 aro 0.75
+  [2] FEAR 0.41 LOVE 1.00 VOID 0.95 CMPLX 0.38  val-0.11 aro 0.79
+  [3] FEAR 1.00 LOVE 0.05 VOID 0.47 CMPLX 1.00  val-1.41 aro 2.10
+  [4] FEAR 0.08 LOVE 0.90 VOID 0.71 CMPLX 0.15  val+0.23 aro 0.23  ←
+
+/bridges → 4/64 (prev=4, curr=4)
+  0→1  count=1  Δval-0.20 Δaro-0.18                      (calm → echo)
+  1→2  count=1  Δval+0.37 Δaro+0.03                      (echo → love)
+  2→3  count=1  Δval-1.30 Δaro+1.31                      ← escalation
+  3→4  count=1  Δval+1.64 Δaro-1.87                      ← recovery
+```
+
+The two key bridges read like a story in numbers:
+
+- **2→3** *love-saturated → terror peak*: valence drops 1.30,
+  arousal jumps 1.31. The cat-in-the-closet prompt didn't just
+  shift the chambers; it carved a transition that Leo can later
+  recognise. *"This is the kind of move where fear takes over."*
+- **3→4** *terror peak → calm rain*: valence flips +1.64,
+  arousal cools 1.87. *"And this is how I usually come back."*
+
+Δtrauma and Δpain stayed near zero in this run because the
+trauma_trigger threshold (prompt-bootstrap overlap ≥ 0.15) was
+not crossed by these prompts; the pulse-only deltas still tell
+the same story through valence and arousal.
+
++3 tests (115 total):
+
+- `leo_bridges_record: no record when island did not change`
+- `leo_bridges_record: edge created when island changes`
+- `leo_bridges_record: count increments on repeat A→B`
+
+`./leo` standalone unchanged. The transitions array sits zero in
+memory if no caller invokes `leo_bridges_record`. Closed-system
+optionality contract held.
+
+The body-perception suite is now five-strong (rings + soma +
+metaleo + mathbrain core + islands + bridges). Phase4 is closed
+on the recording side; the advisor that reads bridges as
+"climate flow" suggestions can land in a later step (it would
+naturally live as a thin layer on top of mathbrain and would
+not require any new C beyond what we have).
+
+Next: **hebbian consolidator** with vendored notorch in `leo.c`
+for the big tensor compression — `leo.c` becomes a single self-
+contained file that includes notorch sources inline, dependency
+tree unchanged.
+
 ---
 
 ## What Leo said (selected)
