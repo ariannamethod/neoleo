@@ -1831,6 +1831,84 @@ static void test_leo_soma_velocity_diff_after_two_slots(void) {
     PASS();
 }
 
+static void test_leo_mathbrain_init_sane(void) {
+    TEST("leo_mathbrain: init weights non-zero, biases zero");
+    Leo leo;
+    leo_init(&leo);
+    int nz_w1 = 0;
+    for (int i = 0; i < LEO_MB_HIDDEN * LEO_MB_INPUTS; i++)
+        if (leo.field.mathbrain.W1[i] != 0.0f) nz_w1++;
+    ASSERT(nz_w1 > 0, "W1 has non-zero entries after init");
+    int z_b1 = 1;
+    for (int i = 0; i < LEO_MB_HIDDEN; i++)
+        if (leo.field.mathbrain.b1[i] != 0.0f) z_b1 = 0;
+    ASSERT(z_b1, "b1 starts at zero");
+    ASSERT(leo.field.mathbrain.train_count == 0, "train_count zero");
+    leo_free(&leo);
+    PASS();
+}
+
+static void test_leo_mathbrain_forward_in_unit_range(void) {
+    TEST("leo_mathbrain_forward: returns sigmoid output in [0, 1]");
+    Leo leo;
+    leo_init(&leo);
+    float y = leo_mathbrain_forward(&leo);
+    ASSERT(y >= 0.0f && y <= 1.0f, "predicted quality in unit range");
+    leo_free(&leo);
+    PASS();
+}
+
+static void test_leo_mathbrain_step_decreases_loss(void) {
+    TEST("leo_mathbrain_step: 200 steps on fixed input drives loss down");
+    Leo leo;
+    leo_init(&leo);
+    /* set deterministic field state so features are reproducible */
+    leo.field.chamber_act[LEO_CH_LOVE] = 0.6f;
+    leo.field.chamber_act[LEO_CH_FEAR] = 0.1f;
+    leo.field.pain = 0.2f;
+    leo.field.trauma = 0.04f;
+    /* drive toward target = 0.8; running_loss starts EMA from 0 */
+    for (int i = 0; i < 200; i++) leo_mathbrain_step(&leo, 0.8f);
+    float final_y = leo.field.mathbrain.last_y;
+    /* After 200 steps the prediction should be on the high side
+     * (closer to 0.8 than to its random init). */
+    ASSERT(final_y > 0.5f, "prediction climbs toward target 0.8");
+    ASSERT(leo.field.mathbrain.train_count == 200, "train_count incremented");
+    leo_free(&leo);
+    PASS();
+}
+
+static void test_leo_mathbrain_advisor_overwhelm(void) {
+    TEST("leo_mathbrain_advisor: high trauma → negative tau_nudge");
+    Leo leo;
+    leo_init(&leo);
+    leo.field.pain = 0.85f;
+    leo.field.trauma = 0.85f * 0.85f; /* 0.7225 */
+    leo.field.chamber_act[LEO_CH_FEAR] = 0.9f;
+    leo_mathbrain_forward(&leo);
+    float n = leo_mathbrain_tau_nudge(&leo);
+    ASSERT(n < 0.0f, "overwhelm produces negative tau_nudge");
+    ASSERT(n >= -LEO_MB_NUDGE_MAX, "tau_nudge clamped above -NUDGE_MAX");
+    leo_free(&leo);
+    PASS();
+}
+
+static void test_leo_mathbrain_advisor_boredom(void) {
+    TEST("leo_mathbrain_advisor: flat field → non-negative tau_nudge");
+    Leo leo;
+    leo_init(&leo);
+    /* very low arousal + low trauma → boredom branch should
+     * dominate (positive nudge) or at least not go negative. */
+    for (int c = 0; c < LEO_N_CHAMBERS; c++) leo.field.chamber_act[c] = 0.05f;
+    leo.field.pain = 0.05f;
+    leo.field.trauma = 0.0025f;
+    leo_mathbrain_forward(&leo);
+    float n = leo_mathbrain_tau_nudge(&leo);
+    ASSERT(n >= 0.0f, "calm boredom does not pull temperature down");
+    leo_free(&leo);
+    PASS();
+}
+
 static void test_leo_bootstrap_fragment_does_not_mutate_field(void) {
     TEST("leo_bootstrap_fragment: leaves field unchanged");
     Leo leo;
@@ -1996,6 +2074,13 @@ int main(void) {
     test_leo_soma_blend_tracks_recent();
     test_leo_soma_velocity_zero_below_two_slots();
     test_leo_soma_velocity_diff_after_two_slots();
+
+    /* mathbrain — body-perception scalar-autograd advisor */
+    test_leo_mathbrain_init_sane();
+    test_leo_mathbrain_forward_in_unit_range();
+    test_leo_mathbrain_step_decreases_loss();
+    test_leo_mathbrain_advisor_overwhelm();
+    test_leo_mathbrain_advisor_boredom();
 
     printf("\n=== results: %d passed, %d failed ===\n\n",
            tests_passed, tests_failed);

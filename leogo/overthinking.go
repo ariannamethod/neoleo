@@ -105,11 +105,13 @@ const (
 // phases.
 func runRing0(leo *LeoGo, req RingRequest) string {
 	pulse := leo.Pulse()
+	nudge := leo.MathbrainTauNudge()
 
 	temp := ring0Temp
 	if pulse.Entropy > 0.7 {
 		temp = ring0TempCalmed
 	}
+	temp += nudge // mathbrain advisor: bored → up, overwhelmed → down
 
 	seed := req.Prompt
 	if req.Reply != "" {
@@ -140,6 +142,7 @@ func runRing0(leo *LeoGo, req RingRequest) string {
 // (wlock) — same discipline as ring 0.
 func runRing1(leo *LeoGo, req RingRequest) string {
 	pulse := leo.Pulse()
+	nudge := leo.MathbrainTauNudge()
 
 	var (
 		seed string
@@ -189,6 +192,8 @@ func runRing1(leo *LeoGo, req RingRequest) string {
 		return ""
 	}
 
+	temp += nudge // mathbrain advisor
+
 	text := leo.GenerateRing(seed, temp, ring1MaxTokens)
 	switch text {
 	case "", ".", "...":
@@ -205,6 +210,7 @@ func runRing1(leo *LeoGo, req RingRequest) string {
 // lower temperature, fewer tokens, tighter shard.
 func runRing2(leo *LeoGo, req RingRequest) string {
 	pulse := leo.Pulse()
+	nudge := leo.MathbrainTauNudge()
 
 	seed := req.Reply
 	if seed == "" {
@@ -222,6 +228,7 @@ func runRing2(leo *LeoGo, req RingRequest) string {
 		maxTokens = ring2MaxWounded
 		mode = "ring2_meta_wounded"
 	}
+	temp += nudge // mathbrain advisor
 
 	text := leo.GenerateRing(seed, temp, maxTokens)
 	switch text {
@@ -238,10 +245,11 @@ func runRing2(leo *LeoGo, req RingRequest) string {
 // fine-grained per-ring snapshots: 1=ring0, 2=ring1, 3=ring2.
 const somaSourceCycle = 0
 
-// workerLoop processes ring requests, runs metaleo, and snapshots
-// soma — in that order, sequentially per request. Each step uses
-// the C side under the LeoGo RWMutex (rlock for generate / pulse,
-// wlock for observe / snapshot, in disjoint scopes).
+// workerLoop processes ring requests, runs metaleo, snapshots soma,
+// and steps mathbrain — in that order, sequentially per request.
+// Each step uses the C side under the LeoGo RWMutex (rlock for
+// generate / pulse, wlock for observe / snapshot / mathbrain step,
+// in disjoint scopes).
 //
 // The order is deliberate:
 //
@@ -251,17 +259,18 @@ const somaSourceCycle = 0
 //   2. metaleo.Process — sees this turn's reply + ring shards,
 //      updates its bootstrap buffer, and (if the moment calls for
 //      it) generates an alternative reply and observes that with
-//      the metaleo_voice tag. Because this happens AFTER the rings,
-//      metaleo's pulse read sees the post-rings field — a small
-//      richer signal than the pre-rings reply state.
+//      the metaleo_voice tag.
 //
-//   3. SomaSnapshot — captures the post-cycle inner state, now
-//      including any metaleo override. The trajectory remembers
-//      whether the inner voice spoke this turn.
+//   3. SomaSnapshot — captures the post-cycle inner state.
 //
-// metaleo's takeover effect is lag-by-one: an alternative observed
-// here colours retention/cooc/chambers, and the NEXT reply is
-// generated from a field already shifted toward the inner voice.
+//   4. MathbrainStep — extracts features (chambers + soma blend +
+//      soma velocity + scalars), runs forward, trains one SGD step
+//      against the actual quality of this turn's base reply.
+//      Refreshes the tau_nudge advisor that the next cycle's rings
+//      will read in their temperature decisions.
+//
+// Step 4 has to come after step 3 so the soma blend + velocity used
+// as MLP inputs already reflect this cycle's snapshot.
 func workerLoop(leo *LeoGo, meta *MetaLeo, ch <-chan RingRequest, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for req := range ch {
@@ -282,6 +291,13 @@ func workerLoop(leo *LeoGo, meta *MetaLeo, ch <-chan RingRequest, wg *sync.WaitG
 		meta.Process(leo, req.Prompt, req.Reply, pulse, shards)
 
 		leo.SomaSnapshot(somaSourceCycle)
+
+		// MathBrain — measure the actual quality of this reply
+		// (Go-side, same scoring metaleo uses), then step the
+		// scalar-autograd MLP. Tau_nudge updates as a side effect
+		// and is consumed by the next cycle's rings.
+		quality := score(req.Reply)
+		leo.MathbrainStep(quality)
 	}
 }
 

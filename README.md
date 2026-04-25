@@ -1376,6 +1376,102 @@ pairs in idle, with cross-pollination from `ariannamethod/doe`.
 Per Oleg's roadmap: metaleo → mathbrain → hebbian consolidator
 (with DOE flavours).
 
+### step 33 — mathbrain core, body-perception advisor in C
+
+Body perception, not training. A small math body that watches
+its own pulse — chambers, soma blend, soma velocity, trauma,
+pain, arousal — and learns the simple pattern *"when this moment
+feels like this, my reply will feel like that"*. Then it nudges
+the next moment's temperature: bored → up, overwhelmed → down,
+stuck → up. MultiLeo logic from legacy, distilled.
+
+Lives inside `leo.c` as a `MathBrain` block on `LeoField`. Pure
+hand-coded scalar autograd. Not notorch — for a 21 → 16 → 1 MLP
+(369 floats total, < 2 KB of weights), notorch would be all
+overhead and no win. Notorch vendoring is reserved for the
+hebbian consolidator step, where big tensor ops actually pay.
+
+C addition:
+
+```c
+typedef struct {
+    float W1[16 * 21];   /* hidden ← input    */
+    float b1[16];
+    float W2[1 * 16];    /* output ← hidden   */
+    float b2[1];
+    float last_features[21];
+    float last_a1[16];   /* tanh(z1) — kept for backprop */
+    float last_y;        /* sigmoid(z2) — predicted quality */
+    float tau_nudge, boredom, overwhelm, stuck;
+    int32_t train_count;
+    float   running_loss;
+} MathBrain;
+```
+
+Functions: `leo_mathbrain_forward` (extract features → forward
+pass → advisor), `leo_mathbrain_train` (one SGD step on
+sigmoid+MSE), `leo_mathbrain_step` (forward+train convenience),
+`leo_mathbrain_tau_nudge` (read advisor), `leo_mathbrain_dump`.
+Init does Xavier-ish small symmetric weights so the first
+forward returns ~0.5 quality before any training.
+
+Persistence: weights + biases + train_count + running_loss
+appended to `leo.state` after the soma block. Sentinel dimensions
+let the loader refuse incompatible shapes (future hidden-size
+bumps) and fall back to fresh random init. Old state files load
+unchanged — mathbrain just starts at random.
+
+**Worker integration** (`workerLoop` per request, in order):
+
+```
+runRing0  →  observe
+runRing1  →  observe
+runRing2  →  observe
+metaleo.Process     (feed buffer, maybe override-observe)
+SomaSnapshot        (post-cycle mood slot)
+quality := score(reply)
+leo.MathbrainStep(quality)   ← new: forward + train + advisor
+```
+
+Each next cycle's rings call `leo.MathbrainTauNudge()` at entry
+and add the value to their temperature. Lag-by-one again: this
+turn's mathbrain decision colours next turn's rings.
+
+REPL gains `/math`: prints train_count, running_loss, predicted
+quality, and the three advisor scores plus tau_nudge.
+
+**Smoke** (`./leogo/leogo leo.txt --repl`, fresh state, 5
+emotionally-charged prompts spaced 2 s, then `/math`):
+
+```
+/math
+> mathbrain:    train_count=3 running_loss=0.0346
+> predicted:    quality=0.50
+> advisor:      boredom=0.82 overwhelm=0.00 stuck=0.00 tau_nudge=+0.13
+```
+
+Three SGD steps drained, `running_loss ≈ 0.035`, advisor reads
+**high boredom** (the field flattened after the wounded peak),
+and `tau_nudge = +0.13` — next rings will run a bit hotter to
+counter the flatness. Exactly the MultiLeo pattern from legacy.
+
+`./leo` standalone still byte-identical. Mathbrain weights are
+allocated by `leo_field_init` and just sit there at random; with
+no caller invoking `leo_mathbrain_step`, they never train and
+never affect anything.
+
++5 tests (106 total):
+- `leo_mathbrain: init weights non-zero, biases zero`
+- `leo_mathbrain_forward: returns sigmoid output in [0, 1]`
+- `leo_mathbrain_step: 200 steps on fixed input drives loss down`
+- `leo_mathbrain_advisor: high trauma → negative tau_nudge`
+- `leo_mathbrain_advisor: flat field → non-negative tau_nudge`
+
+The body-perception suite is open. Mathbrain core is its first
+member. Phase 4 islands and phase4 bridges arrive next — state
+clustering and transition memory layered on top of soma and
+mathbrain together.
+
 ---
 
 ## What Leo said (selected)

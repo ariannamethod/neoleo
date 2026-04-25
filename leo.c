@@ -110,6 +110,18 @@ static const char *LEO_EMBEDDED_BOOTSTRAP =
 #define LEO_SOMA_SLOTS     32       /* ring buffer depth */
 #define LEO_SOMA_DECAY     0.85f    /* exponential weight per slot age */
 
+/* MathBrain — body-perception advisor. Tiny scalar-autograd MLP
+ * inside the field: features → predicted quality + tau nudge. Pure
+ * hand-coded SGD; notorch is overkill for 369 floats. The Go worker
+ * triggers a forward + train per reply-cycle (after soma snapshot),
+ * and the resulting tau_nudge is read back as a temperature shift
+ * for the next cycle's rings. */
+#define LEO_MB_INPUTS    21
+#define LEO_MB_HIDDEN    16
+#define LEO_MB_OUTPUTS    1
+#define LEO_MB_LR        0.05f      /* SGD learning rate */
+#define LEO_MB_NUDGE_MAX 0.20f      /* clamp for tau nudge advisor */
+
 /* Kuramoto-coupled emotional chambers — AML / paper Appendix B.
  * Six chambers live inside LeoField as a body-perception submodule. */
 #define LEO_N_CHAMBERS  6
@@ -737,6 +749,42 @@ typedef struct {
     uint8_t  _pad[7];                  /* explicit pad → stable on-disk size */
 } LeoSomaSlot;
 
+/* ─── MathBrain: body-perception MLP, scalar autograd ──────────────
+ *
+ * 21 inputs (chambers[6] + soma blend[6] + soma velocity[6] +
+ *            trauma + pain + arousal)
+ * 16 hidden (tanh)
+ *  1 output (sigmoid → predicted reply quality, [0,1])
+ *
+ * Trained per reply-cycle: target = composite score of the actual
+ * reply (computed Go-side, mirrors metaleo's _assess). Output also
+ * feeds a MultiLeo-style advisor that returns tau_nudge in
+ * [-NUDGE_MAX, +NUDGE_MAX] — boredom pushes temperature up,
+ * overwhelm pulls it down, stuck-but-safe slightly up.
+ *
+ * 369 floats total, < 2 KB of weights. Persists into leo.state. */
+typedef struct {
+    float W1[LEO_MB_HIDDEN * LEO_MB_INPUTS];
+    float b1[LEO_MB_HIDDEN];
+    float W2[LEO_MB_OUTPUTS * LEO_MB_HIDDEN];
+    float b2[LEO_MB_OUTPUTS];
+
+    /* last forward pass — used by backprop and by /math dump */
+    float last_features[LEO_MB_INPUTS];
+    float last_a1[LEO_MB_HIDDEN];      /* tanh(z1) */
+    float last_y;                       /* sigmoid(z2) — predicted quality */
+
+    /* advisor outputs (refreshed at forward time) */
+    float tau_nudge;                    /* clamped to ±NUDGE_MAX */
+    float boredom;
+    float overwhelm;
+    float stuck;
+
+    /* counters for /math */
+    int32_t train_count;
+    float   running_loss;               /* EMA |error| */
+} MathBrain;
+
 /* ─── LeoField: the physics of Leo's inner state ──────────────────
  *
  * This is the C-native home for the AML-style live state. It is
@@ -803,6 +851,12 @@ typedef struct {
     LeoSomaSlot soma[LEO_SOMA_SLOTS];
     int32_t     soma_ptr;              /* next write index */
     int32_t     soma_n;                /* slots populated, capped at SLOTS */
+
+    /* Body-perception advisor. Same opt-in contract as soma: ./leo
+     * without Go never touches it. Initialised with random weights
+     * once (so even a freshly-loaded organism has a non-degenerate
+     * forward pass) and trained by the leogo worker per reply-cycle. */
+    MathBrain mathbrain;
 } LeoField;
 
 /* chamber decay rates (paper Appendix B.3): FEAR/LOVE/RAGE/VOID/FLOW/COMPLEX */
@@ -1003,6 +1057,25 @@ static void leo_field_init(LeoField *f, int vocab_cap) {
         }
     }
     /* retention state starts at zero — Leo remembers nothing yet */
+
+    /* MathBrain — small symmetric init so the very first forward pass
+     * gives ~0.5 quality predictions instead of saturated extremes.
+     * Xavier-ish: scale ≈ 1/√fan_in. */
+    {
+        MathBrain *m = &f->mathbrain;
+        memset(m, 0, sizeof(*m));
+        float s1 = 1.0f / sqrtf((float)LEO_MB_INPUTS);
+        float s2 = 1.0f / sqrtf((float)LEO_MB_HIDDEN);
+        for (int i = 0; i < LEO_MB_HIDDEN * LEO_MB_INPUTS; i++) {
+            float r = (float)rand() / (float)RAND_MAX - 0.5f;
+            m->W1[i] = 2.0f * s1 * r;
+        }
+        for (int i = 0; i < LEO_MB_OUTPUTS * LEO_MB_HIDDEN; i++) {
+            float r = (float)rand() / (float)RAND_MAX - 0.5f;
+            m->W2[i] = 2.0f * s2 * r;
+        }
+        /* biases stay zero from memset */
+    }
 }
 
 static void leo_field_free(LeoField *f) {
@@ -1449,6 +1522,19 @@ int leo_save_state(const Leo *leo, const char *path) {
     write_i32(f, fld->soma_n);
     fwrite(fld->soma, sizeof(LeoSomaSlot), LEO_SOMA_SLOTS, f);
 
+    /* MathBrain — same append-and-best-effort-read deal. Sentinel
+     * dimensions allow the reader to refuse incompatible shapes
+     * (e.g. future LEO_MB_HIDDEN bump) and fall back to fresh init. */
+    write_i32(f, LEO_MB_INPUTS);
+    write_i32(f, LEO_MB_HIDDEN);
+    write_i32(f, LEO_MB_OUTPUTS);
+    fwrite(fld->mathbrain.W1, sizeof(float), LEO_MB_HIDDEN * LEO_MB_INPUTS, f);
+    fwrite(fld->mathbrain.b1, sizeof(float), LEO_MB_HIDDEN, f);
+    fwrite(fld->mathbrain.W2, sizeof(float), LEO_MB_OUTPUTS * LEO_MB_HIDDEN, f);
+    fwrite(fld->mathbrain.b2, sizeof(float), LEO_MB_OUTPUTS, f);
+    write_i32(f, fld->mathbrain.train_count);
+    write_f32(f, fld->mathbrain.running_loss);
+
     fclose(f);
     return 1;
 }
@@ -1591,6 +1677,36 @@ int leo_load_state(Leo *leo, const char *path) {
          * leave the in-memory buffer as init (zeroed by leo_field_init). */
     }
     /* If read_i32 failed (old file), buffer remains zeroed. Not an error. */
+
+    /* MathBrain — best-effort read just like soma. Sentinel
+     * dimensions guard against shape changes; mismatch keeps the
+     * freshly randomized weights from leo_field_init. */
+    int32_t mb_in = 0, mb_h = 0, mb_o = 0;
+    if (read_i32(f, &mb_in) &&
+        read_i32(f, &mb_h)  &&
+        read_i32(f, &mb_o)) {
+        if (mb_in == LEO_MB_INPUTS &&
+            mb_h  == LEO_MB_HIDDEN &&
+            mb_o  == LEO_MB_OUTPUTS) {
+            size_t n_w1 = (size_t)LEO_MB_HIDDEN * LEO_MB_INPUTS;
+            size_t n_w2 = (size_t)LEO_MB_OUTPUTS * LEO_MB_HIDDEN;
+            int ok = 1;
+            ok &= (fread(fld->mathbrain.W1, sizeof(float), n_w1, f) == n_w1);
+            ok &= (fread(fld->mathbrain.b1, sizeof(float), LEO_MB_HIDDEN, f) == LEO_MB_HIDDEN);
+            ok &= (fread(fld->mathbrain.W2, sizeof(float), n_w2, f) == n_w2);
+            ok &= (fread(fld->mathbrain.b2, sizeof(float), LEO_MB_OUTPUTS, f) == LEO_MB_OUTPUTS);
+            int32_t tc = 0; float rl = 0;
+            ok &= read_i32(f, &tc);
+            ok &= read_f32(f, &rl);
+            if (ok) {
+                fld->mathbrain.train_count = tc;
+                fld->mathbrain.running_loss = rl;
+            }
+            /* On any mid-block failure, weights are partially over-
+             * written but biases / counters keep their init values.
+             * Acceptable: mathbrain is advisory, not load-bearing. */
+        }
+    }
 
     fclose(f);
     return 1;
@@ -3390,6 +3506,183 @@ void leo_soma_dump(const Leo *leo, FILE *out) {
                 i, (long long)s->step, s->vocab_size,
                 s->valence, s->arousal, s->trauma);
     }
+}
+
+/* ================================================================
+ * MATHBRAIN — body-perception MLP, scalar autograd.
+ *
+ * Three-step contract per reply-cycle, all driven from leogo:
+ *
+ *   1. extract_features(leo, x[21])   — chambers + soma blend +
+ *                                       soma velocity + scalars
+ *   2. forward(mb, x[21])             — predicted quality + tau nudge
+ *                                       + boredom/overwhelm/stuck
+ *   3. train(mb, target_quality)      — one SGD step on |y - target|
+ *
+ * The Go worker calls the convenience entry leo_mathbrain_step which
+ * does extract+forward+train atomically; tau_nudge is then read by
+ * the next cycle's rings.
+ * ================================================================ */
+
+static float mb_sigmoid(float x) {
+    if (x >  20.0f) return 1.0f;
+    if (x < -20.0f) return 0.0f;
+    return 1.0f / (1.0f + expf(-x));
+}
+
+static void leo_mathbrain_extract_features(const Leo *leo, float x[LEO_MB_INPUTS]) {
+    if (!leo || !x) return;
+    const LeoField *f = &leo->field;
+
+    /* 0..5 — current chambers */
+    for (int c = 0; c < LEO_N_CHAMBERS; c++) x[c] = f->chamber_act[c];
+
+    /* 6..11 — soma blend (decay-weighted recent chambers) */
+    float blend[LEO_N_CHAMBERS];
+    leo_soma_blend(leo, blend);
+    for (int c = 0; c < LEO_N_CHAMBERS; c++) x[6 + c] = blend[c];
+
+    /* 12..17 — soma velocity (last - prev) */
+    float vel[LEO_N_CHAMBERS];
+    leo_soma_velocity(leo, vel);
+    for (int c = 0; c < LEO_N_CHAMBERS; c++) x[12 + c] = vel[c];
+
+    /* 18 — trauma (pain²) */
+    x[18] = f->trauma;
+    /* 19 — pain composite */
+    x[19] = f->pain;
+    /* 20 — arousal proxy: max(FEAR, LOVE, RAGE) */
+    float a = f->chamber_act[LEO_CH_FEAR];
+    if (f->chamber_act[LEO_CH_LOVE] > a) a = f->chamber_act[LEO_CH_LOVE];
+    if (f->chamber_act[LEO_CH_RAGE] > a) a = f->chamber_act[LEO_CH_RAGE];
+    x[20] = a;
+}
+
+/* MultiLeo-style advisor: from features + predicted quality, decide
+ * whether next cycle should run hotter, colder, or as-is. */
+static void leo_mathbrain_compute_advisor(MathBrain *m, float x[LEO_MB_INPUTS]) {
+    float trauma  = x[18];
+    float arousal = x[20];
+    float quality = m->last_y;
+
+    /* boredom: low arousal + low trauma + medium quality (not stuck,
+     * not overwhelmed — just nothing happening). */
+    float bored_low = (1.0f - arousal) * 0.5f + (1.0f - trauma) * 0.3f;
+    float bored_mid = 1.0f - 2.0f * fabsf(quality - 0.5f);
+    if (bored_mid < 0) bored_mid = 0;
+    m->boredom = bored_low + 0.2f * bored_mid;
+    if (m->boredom < 0) m->boredom = 0;
+    if (m->boredom > 1) m->boredom = 1;
+
+    /* overwhelm: high trauma OR very high arousal */
+    float ow = trauma * 0.6f + (arousal > 0.8f ? (arousal - 0.8f) * 2.0f : 0.0f);
+    m->overwhelm = ow > 1 ? 1 : (ow < 0 ? 0 : ow);
+
+    /* stuck: predicted quality is low */
+    m->stuck = (quality < 0.4f) ? (0.4f - quality) * 2.5f : 0.0f;
+    if (m->stuck > 1) m->stuck = 1;
+
+    /* tau_nudge:
+     *   bored      → push up   (creative wakes)
+     *   overwhelmed → pull down (precise steadies)
+     *   stuck      → push up   (try different)
+     * Overwhelm wins ties — safety first when the body is loud. */
+    float nudge = 0.0f;
+    if (m->overwhelm > 0.5f) {
+        nudge = -LEO_MB_NUDGE_MAX * (m->overwhelm - 0.5f) * 2.0f;
+    } else if (m->boredom > 0.5f) {
+        nudge =  LEO_MB_NUDGE_MAX * (m->boredom - 0.5f) * 2.0f;
+    } else if (m->stuck > 0.5f) {
+        nudge =  LEO_MB_NUDGE_MAX * 0.75f * (m->stuck - 0.5f) * 2.0f;
+    }
+    if (nudge >  LEO_MB_NUDGE_MAX) nudge =  LEO_MB_NUDGE_MAX;
+    if (nudge < -LEO_MB_NUDGE_MAX) nudge = -LEO_MB_NUDGE_MAX;
+    m->tau_nudge = nudge;
+}
+
+float leo_mathbrain_forward(Leo *leo) {
+    if (!leo) return 0.5f;
+    MathBrain *m = &leo->field.mathbrain;
+    float x[LEO_MB_INPUTS];
+    leo_mathbrain_extract_features(leo, x);
+    memcpy(m->last_features, x, sizeof(x));
+
+    /* z1 = W1·x + b1, a1 = tanh(z1) */
+    for (int h = 0; h < LEO_MB_HIDDEN; h++) {
+        float z = m->b1[h];
+        const float *row = &m->W1[h * LEO_MB_INPUTS];
+        for (int i = 0; i < LEO_MB_INPUTS; i++) z += row[i] * x[i];
+        m->last_a1[h] = tanhf(z);
+    }
+    /* z2 = W2·a1 + b2, y = sigmoid(z2) */
+    float z2 = m->b2[0];
+    for (int h = 0; h < LEO_MB_HIDDEN; h++) z2 += m->W2[h] * m->last_a1[h];
+    m->last_y = mb_sigmoid(z2);
+
+    leo_mathbrain_compute_advisor(m, x);
+    return m->last_y;
+}
+
+void leo_mathbrain_train(Leo *leo, float target_quality) {
+    if (!leo) return;
+    MathBrain *m = &leo->field.mathbrain;
+    if (target_quality < 0) target_quality = 0;
+    if (target_quality > 1) target_quality = 1;
+
+    /* sigmoid + MSE backprop:
+     *   dL/dz2 = (y - t) · y · (1 - y)
+     *   dW2[h] = dz2 · a1[h]
+     *   db2    = dz2
+     *   dz1[h] = dz2 · W2[h] · (1 - a1[h]²)
+     *   dW1[h,i] = dz1[h] · x[i]
+     *   db1[h]   = dz1[h] */
+    float y = m->last_y;
+    float dz2 = (y - target_quality) * y * (1.0f - y);
+
+    /* update output layer */
+    for (int h = 0; h < LEO_MB_HIDDEN; h++) {
+        m->W2[h] -= LEO_MB_LR * dz2 * m->last_a1[h];
+    }
+    m->b2[0] -= LEO_MB_LR * dz2;
+
+    /* hidden layer */
+    for (int h = 0; h < LEO_MB_HIDDEN; h++) {
+        float a1 = m->last_a1[h];
+        float dz1 = dz2 * m->W2[h] * (1.0f - a1 * a1);
+        float *row = &m->W1[h * LEO_MB_INPUTS];
+        for (int i = 0; i < LEO_MB_INPUTS; i++) {
+            row[i] -= LEO_MB_LR * dz1 * m->last_features[i];
+        }
+        m->b1[h] -= LEO_MB_LR * dz1;
+    }
+
+    /* track loss as EMA |error| */
+    float err = y - target_quality;
+    if (err < 0) err = -err;
+    m->running_loss = 0.95f * m->running_loss + 0.05f * err;
+    m->train_count++;
+}
+
+float leo_mathbrain_step(Leo *leo, float target_quality) {
+    if (!leo) return 0.5f;
+    leo_mathbrain_forward(leo);
+    leo_mathbrain_train(leo, target_quality);
+    return leo->field.mathbrain.last_y;
+}
+
+float leo_mathbrain_tau_nudge(const Leo *leo) {
+    if (!leo) return 0.0f;
+    return leo->field.mathbrain.tau_nudge;
+}
+
+void leo_mathbrain_dump(const Leo *leo, FILE *out) {
+    if (!leo || !out) return;
+    const MathBrain *m = &leo->field.mathbrain;
+    fprintf(out, "  mathbrain:    train_count=%d running_loss=%.4f\n",
+            m->train_count, m->running_loss);
+    fprintf(out, "  predicted:    quality=%.2f\n", m->last_y);
+    fprintf(out, "  advisor:      boredom=%.2f overwhelm=%.2f stuck=%.2f tau_nudge=%+.2f\n",
+            m->boredom, m->overwhelm, m->stuck, m->tau_nudge);
 }
 
 #ifndef LEO_LIB

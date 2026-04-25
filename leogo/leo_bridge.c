@@ -133,3 +133,25 @@ int leo_bridge_soma_n(void *ptr) {
     if (!ptr) return 0;
     return ((const Leo *)ptr)->field.soma_n;
 }
+
+/* ---- mathbrain (body-perception advisor) ------------------------ */
+
+float leo_bridge_mathbrain_step(void *ptr, float target_quality) {
+    if (!ptr) return 0.5f;
+    return leo_mathbrain_step((Leo *)ptr, target_quality);
+}
+
+float leo_bridge_mathbrain_tau_nudge(void *ptr) {
+    if (!ptr) return 0.0f;
+    return leo_mathbrain_tau_nudge((const Leo *)ptr);
+}
+
+void leo_bridge_mathbrain_dump(void *ptr) {
+    if (!ptr) return;
+    leo_mathbrain_dump((const Leo *)ptr, stdout);
+}
+
+int leo_bridge_mathbrain_train_count(void *ptr) {
+    if (!ptr) return 0;
+    return ((const Leo *)ptr)->field.mathbrain.train_count;
+}

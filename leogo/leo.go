@@ -40,6 +40,11 @@ extern void  leo_bridge_soma_snapshot(void *, int);
 extern void  leo_bridge_soma_dump(void *);
 extern void  leo_bridge_soma_velocity(void *, float *);
 extern int   leo_bridge_soma_n(void *);
+
+extern float leo_bridge_mathbrain_step(void *, float);
+extern float leo_bridge_mathbrain_tau_nudge(void *);
+extern void  leo_bridge_mathbrain_dump(void *);
+extern int   leo_bridge_mathbrain_train_count(void *);
 */
 import "C"
 
@@ -246,6 +251,43 @@ func (lg *LeoGo) SomaN() int {
 	lg.mu.RLock()
 	defer lg.mu.RUnlock()
 	return int(C.leo_bridge_soma_n(lg.ptr))
+}
+
+// ---- mathbrain (body-perception advisor) -------------------------
+//
+// MathbrainStep is the convenience writer: extracts features from
+// current Leo state, runs a forward pass, and trains one SGD step
+// on the supplied target quality. Returns the predicted quality
+// from the forward pass (post-train it is unchanged in m.last_y).
+//
+// MathbrainTauNudge reads the most recent advisor output —
+// boredom / overwhelm / stuck logic distilled into a single
+// temperature shift. The next ring cycle reads this and adjusts.
+//
+// Both calls are short C ops; rlock for read, wlock for step.
+
+func (lg *LeoGo) MathbrainStep(targetQuality float32) float32 {
+	lg.mu.Lock()
+	defer lg.mu.Unlock()
+	return float32(C.leo_bridge_mathbrain_step(lg.ptr, C.float(targetQuality)))
+}
+
+func (lg *LeoGo) MathbrainTauNudge() float32 {
+	lg.mu.RLock()
+	defer lg.mu.RUnlock()
+	return float32(C.leo_bridge_mathbrain_tau_nudge(lg.ptr))
+}
+
+func (lg *LeoGo) MathbrainDump() {
+	lg.mu.RLock()
+	defer lg.mu.RUnlock()
+	C.leo_bridge_mathbrain_dump(lg.ptr)
+}
+
+func (lg *LeoGo) MathbrainTrainCount() int {
+	lg.mu.RLock()
+	defer lg.mu.RUnlock()
+	return int(C.leo_bridge_mathbrain_train_count(lg.ptr))
 }
 
 // BootstrapFragment returns a random sentence from the embedded

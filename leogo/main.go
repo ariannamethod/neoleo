@@ -143,7 +143,7 @@ func main() {
 
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 1<<20), 1<<20)
-	fmt.Println("> type prompts; 'quit' to exit; '/stats' counters; '/soma' mood trajectory; '/meta' inner voice; '/save' persist")
+	fmt.Println("> type prompts; 'quit' to exit; '/stats' counters; '/soma' mood trajectory; '/meta' inner voice; '/math' body advisor; '/save' persist")
 	for {
 		fmt.Print("\nyou> ")
 		if !scanner.Scan() {
@@ -168,6 +168,9 @@ func main() {
 			f, sp, bl := meta.Stats()
 			fmt.Printf("metaleo: feeds=%d speaks=%d buf=%d/%d\n",
 				f, sp, bl, meta.cfg.BufSize)
+			continue
+		case "/math":
+			leo.MathbrainDump()
 			continue
 		case "/save":
 			if leo.Save(statePath) {
