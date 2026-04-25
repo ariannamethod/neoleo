@@ -102,6 +102,14 @@ static const char *LEO_EMBEDDED_BOOTSTRAP =
 #define LEO_RET_CONSERVE    0.39f   /* √(1 - γ²) */
 #define LEO_RET_BIAS_WEIGHT 0.15f
 
+/* Klaus-style somatic ring buffer — numeric memory of inner state,
+ * per reply-cycle. "Memory: numeric somatic states, not words —
+ * remembers HOW, not WHAT." Lexical memory (cooc/bi/tri/vocab),
+ * compressed retention (Griffin S[32]), and now a third register:
+ * trajectory of feelings across replies. */
+#define LEO_SOMA_SLOTS     32       /* ring buffer depth */
+#define LEO_SOMA_DECAY     0.85f    /* exponential weight per slot age */
+
 /* Kuramoto-coupled emotional chambers — AML / paper Appendix B.
  * Six chambers live inside LeoField as a body-perception submodule. */
 #define LEO_N_CHAMBERS  6
@@ -706,6 +714,29 @@ typedef struct {
     int   active;
 } LeoProphecy;
 
+/* ─── LeoSomaSlot: one snapshot of inner state, Klaus-style ──────
+ *
+ * Numeric memory. Klaus's somatic engine keeps a ring buffer of
+ * chamber states across interactions and "forgets what, remembers
+ * how" — Leo borrows the shape: per reply-cycle (after all rings
+ * have observed), capture chambers + trauma + pain + valence +
+ * arousal + step + a tag for what wrote the slot. A trajectory of
+ * feelings parallel to the lexical and retention memories.
+ *
+ * Layout is POD and self-contained (no pointers) so the buffer
+ * persists into leo.state by a single fwrite. */
+typedef struct {
+    float    chambers[LEO_N_CHAMBERS]; /* FEAR/LOVE/RAGE/VOID/FLOW/COMPLEX */
+    float    trauma;                   /* pain² at snapshot time */
+    float    pain;                     /* raw pain composite */
+    float    valence;                  /* LOVE+FLOW − FEAR-VOID, [-2..2] */
+    float    arousal;                  /* FEAR+RAGE+COMPLEX,    [ 0..3]  */
+    int64_t  step;                     /* leo->step at snapshot time */
+    int32_t  vocab_size;               /* lexical-growth marker */
+    uint8_t  source;                   /* 0=cycle, 1=ring0, 2=ring1, 3=ring2 (reserved) */
+    uint8_t  _pad[7];                  /* explicit pad → stable on-disk size */
+} LeoSomaSlot;
+
 /* ─── LeoField: the physics of Leo's inner state ──────────────────
  *
  * This is the C-native home for the AML-style live state. It is
@@ -764,6 +795,14 @@ typedef struct {
      * inside leo_field_step. Encodes a compressed summary of recent
      * tokens; candidates that resonate with it get a bias pull. */
     float retention_state[LEO_RET_DIM];
+
+    /* Somatic ring buffer — see LeoSomaSlot. Filled by leogo's worker
+     * goroutine after each reply-cycle (post-rings). The C reply path
+     * never writes here, so ./leo without Go just leaves it zero.
+     * A pure additive memory: opt-in writers, opt-in readers. */
+    LeoSomaSlot soma[LEO_SOMA_SLOTS];
+    int32_t     soma_ptr;              /* next write index */
+    int32_t     soma_n;                /* slots populated, capped at SLOTS */
 } LeoField;
 
 /* chamber decay rates (paper Appendix B.3): FEAR/LOVE/RAGE/VOID/FLOW/COMPLEX */
@@ -1401,6 +1440,15 @@ int leo_save_state(const Leo *leo, const char *path) {
         fwrite(fld->w_embed, sizeof(float),
                (size_t)fld->w_embed_cap * LEO_RET_DIM, f);
 
+    /* Soma ring buffer — appended at the end so old state files
+     * (without this block) still load: the reader treats the soma
+     * read as best-effort and leaves the buffer zeroed if the file
+     * ends here. */
+    write_i32(f, LEO_SOMA_SLOTS);
+    write_i32(f, fld->soma_ptr);
+    write_i32(f, fld->soma_n);
+    fwrite(fld->soma, sizeof(LeoSomaSlot), LEO_SOMA_SLOTS, f);
+
     fclose(f);
     return 1;
 }
@@ -1515,6 +1563,34 @@ int leo_load_state(Leo *leo, const char *path) {
         fread(fld->w_embed, sizeof(float),
               (size_t)wec * LEO_RET_DIM, f);
     else { fclose(f); return 0; }
+
+    /* Soma — best-effort read. Old state files (pre-29f) end here;
+     * we leave the buffer zeroed and still return success. New files
+     * carry slot count + ptr + n + buffer. Stride mismatch (e.g.
+     * different LEO_SOMA_SLOTS in the future) is treated as "no
+     * compatible soma data" and falls back to zero, never failing. */
+    int32_t soma_slots = 0, soma_ptr = 0, soma_n = 0;
+    if (read_i32(f, &soma_slots) &&
+        read_i32(f, &soma_ptr)   &&
+        read_i32(f, &soma_n)) {
+        if (soma_slots == LEO_SOMA_SLOTS &&
+            soma_ptr >= 0 && soma_ptr < LEO_SOMA_SLOTS &&
+            soma_n   >= 0 && soma_n   <= LEO_SOMA_SLOTS) {
+            size_t got = fread(fld->soma, sizeof(LeoSomaSlot),
+                               LEO_SOMA_SLOTS, f);
+            if (got == (size_t)LEO_SOMA_SLOTS) {
+                fld->soma_ptr = soma_ptr;
+                fld->soma_n   = soma_n;
+            } else {
+                memset(fld->soma, 0, sizeof(fld->soma));
+                fld->soma_ptr = 0;
+                fld->soma_n   = 0;
+            }
+        }
+        /* else: soma block in file uses incompatible LEO_SOMA_SLOTS;
+         * leave the in-memory buffer as init (zeroed by leo_field_init). */
+    }
+    /* If read_i32 failed (old file), buffer remains zeroed. Not an error. */
 
     fclose(f);
     return 1;
@@ -3209,6 +3285,111 @@ int leo_bootstrap_fragment(const Leo *leo, char *out, int max_len) {
     memcpy(out, bs + starts[pick], frag_len);
     out[frag_len] = 0;
     return frag_len;
+}
+
+/* ================================================================
+ * SOMA — Klaus-style numeric memory of inner state.
+ *
+ * Lives in LeoField.soma[] as a small ring buffer. Writers fill
+ * one slot per reply-cycle (after all rings have observed) via
+ * leo_soma_store. Readers peek through leo_soma_blend (weighted
+ * recent chambers) and leo_soma_velocity (delta between two most
+ * recent slots). The C reply path never calls store — without
+ * Go, the buffer simply stays empty. Optional, additive.
+ * ================================================================ */
+
+void leo_soma_store(Leo *leo, uint8_t source) {
+    if (!leo) return;
+    LeoField *f = &leo->field;
+
+    LeoSomaSlot *slot = &f->soma[f->soma_ptr];
+    memcpy(slot->chambers, f->chamber_act, LEO_N_CHAMBERS * sizeof(float));
+    slot->trauma = f->trauma;
+    slot->pain   = f->pain;
+
+    /* valence ≈ "good feeling minus bad feeling"; arousal ≈ intensity. */
+    float valence = f->chamber_act[LEO_CH_LOVE] + f->chamber_act[LEO_CH_FLOW]
+                  - f->chamber_act[LEO_CH_FEAR] - f->chamber_act[LEO_CH_VOID];
+    float arousal = f->chamber_act[LEO_CH_FEAR] + f->chamber_act[LEO_CH_RAGE]
+                  + f->chamber_act[LEO_CH_COMPLEX];
+    if (valence < -2.0f) valence = -2.0f;
+    if (valence >  2.0f) valence =  2.0f;
+    if (arousal <  0.0f) arousal =  0.0f;
+    if (arousal >  3.0f) arousal =  3.0f;
+    slot->valence = valence;
+    slot->arousal = arousal;
+
+    slot->step       = (int64_t)leo->step;
+    slot->vocab_size = (int32_t)leo->bpe.vocab_size;
+    slot->source     = source;
+    memset(slot->_pad, 0, sizeof(slot->_pad));
+
+    f->soma_ptr = (f->soma_ptr + 1) % LEO_SOMA_SLOTS;
+    if (f->soma_n < LEO_SOMA_SLOTS) f->soma_n++;
+}
+
+void leo_soma_blend(const Leo *leo, float out_chambers[LEO_N_CHAMBERS]) {
+    for (int c = 0; c < LEO_N_CHAMBERS; c++) out_chambers[c] = 0.0f;
+    if (!leo) return;
+    const LeoField *f = &leo->field;
+    if (f->soma_n <= 0) return;
+
+    float weighted[LEO_N_CHAMBERS] = {0};
+    float total_w = 0.0f;
+    for (int i = 0; i < f->soma_n; i++) {
+        int idx = (f->soma_ptr - 1 - i + LEO_SOMA_SLOTS) % LEO_SOMA_SLOTS;
+        float w = powf(LEO_SOMA_DECAY, (float)i);
+        for (int c = 0; c < LEO_N_CHAMBERS; c++)
+            weighted[c] += f->soma[idx].chambers[c] * w;
+        total_w += w;
+    }
+    if (total_w > 1e-8f) {
+        for (int c = 0; c < LEO_N_CHAMBERS; c++)
+            out_chambers[c] = weighted[c] / total_w;
+    }
+}
+
+void leo_soma_velocity(const Leo *leo, float out_velocity[LEO_N_CHAMBERS]) {
+    for (int c = 0; c < LEO_N_CHAMBERS; c++) out_velocity[c] = 0.0f;
+    if (!leo) return;
+    const LeoField *f = &leo->field;
+    if (f->soma_n < 2) return;
+
+    int i_now  = (f->soma_ptr - 1 + LEO_SOMA_SLOTS) % LEO_SOMA_SLOTS;
+    int i_prev = (f->soma_ptr - 2 + LEO_SOMA_SLOTS) % LEO_SOMA_SLOTS;
+    for (int c = 0; c < LEO_N_CHAMBERS; c++)
+        out_velocity[c] = f->soma[i_now].chambers[c] -
+                          f->soma[i_prev].chambers[c];
+}
+
+void leo_soma_dump(const Leo *leo, FILE *out) {
+    if (!leo || !out) return;
+    const LeoField *f = &leo->field;
+    fprintf(out, "  soma:        %d/%d slots\n", f->soma_n, LEO_SOMA_SLOTS);
+    if (f->soma_n <= 0) return;
+
+    float blend[LEO_N_CHAMBERS], vel[LEO_N_CHAMBERS];
+    leo_soma_blend(leo, blend);
+    leo_soma_velocity(leo, vel);
+
+    fprintf(out, "  blend:       FEAR %.2f LOVE %.2f RAGE %.2f "
+                 "VOID %.2f FLOW %.2f CMPLX %.2f\n",
+            blend[LEO_CH_FEAR], blend[LEO_CH_LOVE], blend[LEO_CH_RAGE],
+            blend[LEO_CH_VOID], blend[LEO_CH_FLOW], blend[LEO_CH_COMPLEX]);
+    fprintf(out, "  velocity:    F%+.2f L%+.2f R%+.2f V%+.2f F%+.2f C%+.2f\n",
+            vel[LEO_CH_FEAR], vel[LEO_CH_LOVE], vel[LEO_CH_RAGE],
+            vel[LEO_CH_VOID], vel[LEO_CH_FLOW], vel[LEO_CH_COMPLEX]);
+
+    /* last few slots — newest first */
+    int show = f->soma_n < 6 ? f->soma_n : 6;
+    fprintf(out, "  last %d slots (newest first):\n", show);
+    for (int i = 0; i < show; i++) {
+        int idx = (f->soma_ptr - 1 - i + LEO_SOMA_SLOTS) % LEO_SOMA_SLOTS;
+        const LeoSomaSlot *s = &f->soma[idx];
+        fprintf(out, "    [%d] step=%lld voc=%d val%+.2f aro%.2f trauma%.2f\n",
+                i, (long long)s->step, s->vocab_size,
+                s->valence, s->arousal, s->trauma);
+    }
 }
 
 #ifndef LEO_LIB

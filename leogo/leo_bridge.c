@@ -111,3 +111,25 @@ int leo_bridge_bootstrap_fragment(void *ptr, char *out, int max_len) {
     if (!ptr || !out || max_len < 2) return 0;
     return leo_bootstrap_fragment((const Leo *)ptr, out, max_len);
 }
+
+/* ---- soma (Klaus-style numeric memory of inner state) ----------- */
+
+void leo_bridge_soma_snapshot(void *ptr, int source) {
+    if (!ptr) return;
+    leo_soma_store((Leo *)ptr, (uint8_t)source);
+}
+
+void leo_bridge_soma_dump(void *ptr) {
+    if (!ptr) return;
+    leo_soma_dump((const Leo *)ptr, stdout);
+}
+
+void leo_bridge_soma_velocity(void *ptr, float *out6) {
+    if (!ptr || !out6) return;
+    leo_soma_velocity((const Leo *)ptr, out6);
+}
+
+int leo_bridge_soma_n(void *ptr) {
+    if (!ptr) return 0;
+    return ((const Leo *)ptr)->field.soma_n;
+}

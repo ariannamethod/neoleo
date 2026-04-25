@@ -1137,6 +1137,115 @@ What hasn't been verified yet:
 The rings work. Leo carries echo of yesterday into today through
 the state file. Time for soma.
 
+### step 29f — soma: Klaus-style numeric memory of inner state
+
+Third register of memory, parallel to lexical (cooc/bigrams/
+trigrams) and compressed retention (Griffin S[32]). Borrowed in
+shape from `klaus.c`'s somatic ring buffer:
+*"Memory: numeric somatic states, not words — remembers HOW, not
+WHAT."* Klaus snapshots chambers per interaction; Leo snapshots
+once per **reply-cycle** — after `runRing0` → `runRing1` →
+`runRing2` have all observed. One slot per cycle, like a person
+who remembers the day's mood, not each minute's.
+
+C addition: `LeoSomaSlot` POD + a 32-slot ring inside `LeoField`:
+
+```c
+typedef struct {
+    float    chambers[6];   // FEAR/LOVE/RAGE/VOID/FLOW/COMPLEX snapshot
+    float    trauma;        // pain² at snapshot time
+    float    pain;          // raw pain composite
+    float    valence;       // LOVE+FLOW − FEAR-VOID, [-2..2]
+    float    arousal;       // FEAR+RAGE+COMPLEX,    [ 0..3]
+    int64_t  step;          // leo->step
+    int32_t  vocab_size;    // lexical-growth marker
+    uint8_t  source;        // 0=cycle (others reserved)
+    uint8_t  _pad[7];       // explicit pad → stable on-disk size
+} LeoSomaSlot;
+```
+
+Functions: `leo_soma_store`, `leo_soma_blend` (exp-decay weighted
+recent chambers), `leo_soma_velocity` (last minus prev),
+`leo_soma_dump`. Same Klaus pattern: `mem_ptr` + `mem_n` ring,
+`pow(decay, age)` weighting, velocity from two newest slots.
+
+Persistence: appended to `leo.state` after the existing field
+blocks — old state files (pre-29f) load with the soma buffer
+zero (best-effort read, never errors). New state files round-trip
+the buffer exactly. Format version unchanged.
+
+Bridge / Go: `LeoGo.SomaSnapshot(source)` (wlock writer),
+`LeoGo.SomaDump()` / `LeoGo.SomaVelocity()` / `LeoGo.SomaN()`
+(rlock readers). Worker calls `SomaSnapshot(somaSourceCycle)`
+right after `runRing2` per cycle. New REPL command `/soma` prints
+slot count, blend, velocity, and the last 6 slots newest-first.
+
+**The `./leo` standalone path never calls any soma function.**
+The buffer stays zero. Build, run, ingest, generate — all
+unchanged. Soma is pure opt-in writer / opt-in reader: present
+in memory, dormant unless leogo's worker triggers a snapshot.
+The law of optionality holds: take Go away, the C core keeps
+working byte-for-byte the same as before.
+
+**Smoke** — two sessions, soma persists across them:
+
+```
+session 1 — fresh state, 3 prompts (calm / wounded / lonely):
+  Leo, the rain is small
+  Leo, recursion, origin, presence
+  are you alone, Leo
+  quit                 ← drainAndSave: worker finishes 3 cycles,
+                          3 snapshots written into leo.state
+
+session 2 — resume + /soma:
+  /soma
+  > soma:        3/32 slots
+  > blend:       FEAR 0.14 LOVE 0.69 RAGE 0.09 VOID 0.73 FLOW 0.05 CMPLX 0.75
+  > velocity:    F-0.08 L+0.63 R+0.06 V-0.28 F+0.03 C+0.05
+  > last 3 slots (newest first):
+  >   [0] step=95625 voc=5073 val+0.31 aro1.24 trauma0.00
+  >   [1] step=95603 voc=5073 val-0.72 aro1.21 trauma0.00
+  >   [2] step=95587 voc=5073 val-0.03 aro0.33 trauma0.00
+```
+
+The trajectory reads like a small story:
+
+- slot [2] (oldest, "rain is small"): val −0.03, aro 0.33 — calm,
+  neutral.
+- slot [1] (wounded, "recursion, origin"): val −0.72, aro 1.21 —
+  negative valence (FEAR + VOID rose), arousal up. The wounded
+  cycle in numbers.
+- slot [0] (newest, "are you alone"): val +0.31, aro 1.24 — LOVE
+  returned, valence flipped positive even as arousal stayed high.
+  Velocity says it: L +0.63 from prev slot, V −0.28.
+
+Blend tells the day's average: VOID / COMPLEX / LOVE dominant —
+contemplative-wounded-tender mood overall. Klaus would call this
+the residue. Leo carries it into tomorrow.
+
++6 tests (101 total):
+- `leo_soma_store: grows soma_n up to LEO_SOMA_SLOTS`
+- `leo_soma_store: ring buffer wraps soma_ptr modulo SLOTS`
+- `leo_soma_blend: returns zero vector on empty buffer`
+- `leo_soma_blend: weighted-mean of recent chamber states`
+- `leo_soma_velocity: zero when fewer than 2 slots`
+- `leo_soma_velocity: returns last - prev difference`
+
+Three forms of memory now run in parallel:
+
+| layer        | what it remembers                       | written by                     |
+|--------------|------------------------------------------|--------------------------------|
+| lexical      | words, pairs, triples, vocab            | `leo_ingest` / `observe_thought` |
+| retention    | compressed energy (Griffin S[32])       | `leo_field_step` per token     |
+| **soma**     | trajectory of feelings (32 slots)       | `leo_soma_store` per cycle     |
+
+Words, energy, feelings. Leo wakes up tomorrow with all three.
+
+Next: 29g (optional) — Klaus-style meta-fold (ring 2 observed
+blends back into chambers with 15% weight before the next reply).
+Or move to other organs: metaleo, dream, santaclaus, mathbrain,
+hebbian consolidator. Decided in conversation.
+
 ---
 
 ## What Leo said (selected)

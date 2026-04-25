@@ -35,6 +35,11 @@ extern int   leo_bridge_generate_ring(void *, const char *, float, int, char *, 
 extern void  leo_bridge_observe_thought(void *, const char *, const char *);
 extern void  leo_bridge_pulse(void *, float *, float *, float *);
 extern int   leo_bridge_bootstrap_fragment(void *, char *, int);
+
+extern void  leo_bridge_soma_snapshot(void *, int);
+extern void  leo_bridge_soma_dump(void *);
+extern void  leo_bridge_soma_velocity(void *, float *);
+extern int   leo_bridge_soma_n(void *);
 */
 import "C"
 
@@ -201,6 +206,46 @@ func (lg *LeoGo) Pulse() Pulse {
 		Arousal: float32(a),
 		Novelty: float32(n),
 	}
+}
+
+// ---- soma (Klaus-style numeric memory) ----------------------------
+//
+// Snapshot writes a slot — wlock. Dump and velocity read — rlock.
+
+// SomaSnapshot stores the current inner-state into the soma ring
+// buffer. Called once per reply-cycle by the worker, after all
+// rings have observed.
+//
+// source: 0 = post-cycle (the only value used for now).
+//         Other values are reserved for future fine-grained snapshots.
+func (lg *LeoGo) SomaSnapshot(source int) {
+	lg.mu.Lock()
+	defer lg.mu.Unlock()
+	C.leo_bridge_soma_snapshot(lg.ptr, C.int(source))
+}
+
+func (lg *LeoGo) SomaDump() {
+	lg.mu.RLock()
+	defer lg.mu.RUnlock()
+	C.leo_bridge_soma_dump(lg.ptr)
+}
+
+func (lg *LeoGo) SomaVelocity() [6]float32 {
+	var v [6]C.float
+	lg.mu.RLock()
+	C.leo_bridge_soma_velocity(lg.ptr, &v[0])
+	lg.mu.RUnlock()
+	var out [6]float32
+	for i := 0; i < 6; i++ {
+		out[i] = float32(v[i])
+	}
+	return out
+}
+
+func (lg *LeoGo) SomaN() int {
+	lg.mu.RLock()
+	defer lg.mu.RUnlock()
+	return int(C.leo_bridge_soma_n(lg.ptr))
 }
 
 // BootstrapFragment returns a random sentence from the embedded

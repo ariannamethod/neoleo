@@ -230,17 +230,29 @@ func runRing2(leo *LeoGo, req RingRequest) {
 	leo.ObserveThought(text, "overthinking:"+mode)
 }
 
+// somaSourceCycle marks a snapshot taken after a full reply-cycle
+// (reply + ring0 + ring1 + ring2 all observed). Reserved for future
+// fine-grained per-ring snapshots: 1=ring0, 2=ring1, 3=ring2.
+const somaSourceCycle = 0
+
 // workerLoop is the long-lived goroutine that processes ring
 // requests. Each ring runs sequentially: generate (rlock),
 // observe (wlock), next ring. The rlock and wlock scopes are
 // disjoint, so future parallel-ring rework can opt into shared
 // rlock during generate without changing observe.
+//
+// After all three rings have observed, a soma snapshot stores the
+// post-cycle inner state — chambers, trauma, pain, valence, arousal,
+// step, vocab — into Leo's ring buffer. One snapshot per cycle, not
+// per ring: the aggregated picture of feeling, like a person who
+// remembers the day's mood, not each minute's mood.
 func workerLoop(leo *LeoGo, ch <-chan RingRequest, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for req := range ch {
 		runRing0(leo, req)
 		runRing1(leo, req)
 		runRing2(leo, req)
+		leo.SomaSnapshot(somaSourceCycle)
 	}
 }
 

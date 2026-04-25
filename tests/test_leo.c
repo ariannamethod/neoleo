@@ -1739,6 +1739,98 @@ static void test_leo_bootstrap_fragment_returns_sentence(void) {
     PASS();
 }
 
+static void test_leo_soma_store_grows_buffer(void) {
+    TEST("leo_soma_store: grows soma_n up to LEO_SOMA_SLOTS");
+    Leo leo;
+    leo_init(&leo);
+    ASSERT(leo.field.soma_n == 0, "fresh Leo has empty soma");
+    leo_soma_store(&leo, 0);
+    ASSERT(leo.field.soma_n == 1, "soma_n grew to 1 after store");
+    for (int i = 0; i < LEO_SOMA_SLOTS + 5; i++) leo_soma_store(&leo, 0);
+    ASSERT(leo.field.soma_n == LEO_SOMA_SLOTS, "soma_n caps at SLOTS");
+    leo_free(&leo);
+    PASS();
+}
+
+static void test_leo_soma_store_wraps_ptr(void) {
+    TEST("leo_soma_store: ring buffer wraps soma_ptr modulo SLOTS");
+    Leo leo;
+    leo_init(&leo);
+    for (int i = 0; i < LEO_SOMA_SLOTS; i++) leo_soma_store(&leo, 0);
+    ASSERT(leo.field.soma_ptr == 0, "ptr returns to 0 after one wrap");
+    leo_soma_store(&leo, 0);
+    ASSERT(leo.field.soma_ptr == 1, "ptr advances past wrap");
+    leo_free(&leo);
+    PASS();
+}
+
+static void test_leo_soma_blend_zero_on_empty(void) {
+    TEST("leo_soma_blend: returns zero vector on empty buffer");
+    Leo leo;
+    leo_init(&leo);
+    float blend[LEO_N_CHAMBERS];
+    leo_soma_blend(&leo, blend);
+    for (int c = 0; c < LEO_N_CHAMBERS; c++) {
+        ASSERT(blend[c] == 0.0f, "blend channel zero on empty soma");
+    }
+    leo_free(&leo);
+    PASS();
+}
+
+static void test_leo_soma_blend_tracks_recent(void) {
+    TEST("leo_soma_blend: weighted-mean of recent chamber states");
+    Leo leo;
+    leo_init(&leo);
+    /* slot 0 — LOVE 0.2 */
+    leo.field.chamber_act[LEO_CH_LOVE] = 0.2f;
+    leo_soma_store(&leo, 0);
+    /* slot 1 — LOVE 0.8 */
+    leo.field.chamber_act[LEO_CH_LOVE] = 0.8f;
+    leo_soma_store(&leo, 0);
+    float blend[LEO_N_CHAMBERS];
+    leo_soma_blend(&leo, blend);
+    /* most recent dominates: blend.LOVE should be > 0.5 (closer to 0.8) */
+    ASSERT(blend[LEO_CH_LOVE] > 0.5f && blend[LEO_CH_LOVE] < 0.8f,
+           "blend.LOVE between 0.5 and 0.8 (decay-weighted)");
+    leo_free(&leo);
+    PASS();
+}
+
+static void test_leo_soma_velocity_zero_below_two_slots(void) {
+    TEST("leo_soma_velocity: zero when fewer than 2 slots");
+    Leo leo;
+    leo_init(&leo);
+    float vel[LEO_N_CHAMBERS];
+    leo_soma_velocity(&leo, vel);
+    for (int c = 0; c < LEO_N_CHAMBERS; c++) {
+        ASSERT(vel[c] == 0.0f, "velocity zero on 0 slots");
+    }
+    leo_soma_store(&leo, 0);
+    leo_soma_velocity(&leo, vel);
+    for (int c = 0; c < LEO_N_CHAMBERS; c++) {
+        ASSERT(vel[c] == 0.0f, "velocity zero on 1 slot");
+    }
+    leo_free(&leo);
+    PASS();
+}
+
+static void test_leo_soma_velocity_diff_after_two_slots(void) {
+    TEST("leo_soma_velocity: returns last - prev difference");
+    Leo leo;
+    leo_init(&leo);
+    leo.field.chamber_act[LEO_CH_FEAR] = 0.3f;
+    leo_soma_store(&leo, 0);
+    leo.field.chamber_act[LEO_CH_FEAR] = 0.7f;
+    leo_soma_store(&leo, 0);
+    float vel[LEO_N_CHAMBERS];
+    leo_soma_velocity(&leo, vel);
+    /* delta = 0.7 - 0.3 = +0.4 (within float tolerance) */
+    ASSERT(vel[LEO_CH_FEAR] > 0.39f && vel[LEO_CH_FEAR] < 0.41f,
+           "FEAR velocity ≈ +0.4");
+    leo_free(&leo);
+    PASS();
+}
+
 static void test_leo_bootstrap_fragment_does_not_mutate_field(void) {
     TEST("leo_bootstrap_fragment: leaves field unchanged");
     Leo leo;
@@ -1896,6 +1988,14 @@ int main(void) {
     test_leo_observe_thought_moves_chambers();
     test_leo_bootstrap_fragment_returns_sentence();
     test_leo_bootstrap_fragment_does_not_mutate_field();
+
+    /* soma — Klaus-style numeric memory of inner state */
+    test_leo_soma_store_grows_buffer();
+    test_leo_soma_store_wraps_ptr();
+    test_leo_soma_blend_zero_on_empty();
+    test_leo_soma_blend_tracks_recent();
+    test_leo_soma_velocity_zero_below_two_slots();
+    test_leo_soma_velocity_diff_after_two_slots();
 
     printf("\n=== results: %d passed, %d failed ===\n\n",
            tests_passed, tests_failed);
