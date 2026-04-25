@@ -105,6 +105,12 @@ func main() {
 		}
 	}
 
+	// metaleo — Leo's inner voice. Runs inside the worker pipeline
+	// after the three rings, not on the reply path. If its
+	// alternative wins, it gets observed back with a distinct tag,
+	// recolouring the next turn. Bootstrap buffer in-memory only.
+	meta := NewMetaLeo()
+
 	// Spawn the overthinking worker. One long-lived goroutine that
 	// processes ring requests from a buffered channel. If the channel
 	// is full the request is dropped — rings never block replies.
@@ -113,7 +119,7 @@ func main() {
 	ringCh := make(chan RingRequest, ringChanBufferSize)
 	var workerWG sync.WaitGroup
 	workerWG.Add(1)
-	go workerLoop(leo, ringCh, &workerWG)
+	go workerLoop(leo, meta, ringCh, &workerWG)
 
 	drainAndSave := func() {
 		close(ringCh)
@@ -137,7 +143,7 @@ func main() {
 
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 1<<20), 1<<20)
-	fmt.Println("> type prompts; 'quit' to exit; '/stats' counters; '/soma' mood trajectory; '/save' persist")
+	fmt.Println("> type prompts; 'quit' to exit; '/stats' counters; '/soma' mood trajectory; '/meta' inner voice; '/save' persist")
 	for {
 		fmt.Print("\nyou> ")
 		if !scanner.Scan() {
@@ -157,6 +163,11 @@ func main() {
 			continue
 		case "/soma":
 			leo.SomaDump()
+			continue
+		case "/meta":
+			f, sp, bl := meta.Stats()
+			fmt.Printf("metaleo: feeds=%d speaks=%d buf=%d/%d\n",
+				f, sp, bl, meta.cfg.BufSize)
 			continue
 		case "/save":
 			if leo.Save(statePath) {

@@ -103,7 +103,7 @@ const (
 // separate scopes — the rlock is released before the wlock is
 // acquired — so future parallel rings can overlap their generate
 // phases.
-func runRing0(leo *LeoGo, req RingRequest) {
+func runRing0(leo *LeoGo, req RingRequest) string {
 	pulse := leo.Pulse()
 
 	temp := ring0Temp
@@ -120,16 +120,17 @@ func runRing0(leo *LeoGo, req RingRequest) {
 		}
 	}
 	if seed == "" {
-		return
+		return ""
 	}
 
 	text := leo.GenerateRing(seed, temp, ring0MaxTokens)
 	switch text {
 	case "", ".", "...":
-		return
+		return ""
 	}
 
 	leo.ObserveThought(text, "overthinking:ring0")
+	return text
 }
 
 // runRing1 generates one drift ring with pulse-aware seed and
@@ -137,7 +138,7 @@ func runRing0(leo *LeoGo, req RingRequest) {
 // branch decides seed/temp/mode without re-touching the field.
 // Then a single read-only generate (rlock) and a single observe
 // (wlock) — same discipline as ring 0.
-func runRing1(leo *LeoGo, req RingRequest) {
+func runRing1(leo *LeoGo, req RingRequest) string {
 	pulse := leo.Pulse()
 
 	var (
@@ -185,23 +186,24 @@ func runRing1(leo *LeoGo, req RingRequest) {
 	}
 
 	if seed == "" {
-		return
+		return ""
 	}
 
 	text := leo.GenerateRing(seed, temp, ring1MaxTokens)
 	switch text {
 	case "", ".", "...":
-		return
+		return ""
 	}
 
 	leo.ObserveThought(text, "overthinking:"+mode)
+	return text
 }
 
 // runRing2 — the meta ring. Smallest, hottest, most abstract.
 // Seed is just the reply (the meta pass abstracts what was
 // actually said, not what was asked). Wounded mode narrows it:
 // lower temperature, fewer tokens, tighter shard.
-func runRing2(leo *LeoGo, req RingRequest) {
+func runRing2(leo *LeoGo, req RingRequest) string {
 	pulse := leo.Pulse()
 
 	seed := req.Reply
@@ -209,7 +211,7 @@ func runRing2(leo *LeoGo, req RingRequest) {
 		seed = req.Prompt
 	}
 	if seed == "" {
-		return
+		return ""
 	}
 
 	temp := ring2Temp
@@ -224,10 +226,11 @@ func runRing2(leo *LeoGo, req RingRequest) {
 	text := leo.GenerateRing(seed, temp, maxTokens)
 	switch text {
 	case "", ".", "...":
-		return
+		return ""
 	}
 
 	leo.ObserveThought(text, "overthinking:"+mode)
+	return text
 }
 
 // somaSourceCycle marks a snapshot taken after a full reply-cycle
@@ -235,23 +238,49 @@ func runRing2(leo *LeoGo, req RingRequest) {
 // fine-grained per-ring snapshots: 1=ring0, 2=ring1, 3=ring2.
 const somaSourceCycle = 0
 
-// workerLoop is the long-lived goroutine that processes ring
-// requests. Each ring runs sequentially: generate (rlock),
-// observe (wlock), next ring. The rlock and wlock scopes are
-// disjoint, so future parallel-ring rework can opt into shared
-// rlock during generate without changing observe.
+// workerLoop processes ring requests, runs metaleo, and snapshots
+// soma — in that order, sequentially per request. Each step uses
+// the C side under the LeoGo RWMutex (rlock for generate / pulse,
+// wlock for observe / snapshot, in disjoint scopes).
 //
-// After all three rings have observed, a soma snapshot stores the
-// post-cycle inner state — chambers, trauma, pain, valence, arousal,
-// step, vocab — into Leo's ring buffer. One snapshot per cycle, not
-// per ring: the aggregated picture of feeling, like a person who
-// remembers the day's mood, not each minute's mood.
-func workerLoop(leo *LeoGo, ch <-chan RingRequest, wg *sync.WaitGroup) {
+// The order is deliberate:
+//
+//   1. runRing0 / runRing1 / runRing2 — the three rings observe
+//      their texts back, evolving cooc/bi/tri/chambers/retention.
+//
+//   2. metaleo.Process — sees this turn's reply + ring shards,
+//      updates its bootstrap buffer, and (if the moment calls for
+//      it) generates an alternative reply and observes that with
+//      the metaleo_voice tag. Because this happens AFTER the rings,
+//      metaleo's pulse read sees the post-rings field — a small
+//      richer signal than the pre-rings reply state.
+//
+//   3. SomaSnapshot — captures the post-cycle inner state, now
+//      including any metaleo override. The trajectory remembers
+//      whether the inner voice spoke this turn.
+//
+// metaleo's takeover effect is lag-by-one: an alternative observed
+// here colours retention/cooc/chambers, and the NEXT reply is
+// generated from a field already shifted toward the inner voice.
+func workerLoop(leo *LeoGo, meta *MetaLeo, ch <-chan RingRequest, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for req := range ch {
-		runRing0(leo, req)
-		runRing1(leo, req)
-		runRing2(leo, req)
+		t0 := runRing0(leo, req)
+		t1 := runRing1(leo, req)
+		t2 := runRing2(leo, req)
+
+		// Order shards newest/most-relevant first — ring2 is the
+		// abstract shard metaleo cares about most.
+		var shards []string
+		for _, t := range []string{t2, t1, t0} {
+			if t != "" {
+				shards = append(shards, t)
+			}
+		}
+
+		pulse := leo.Pulse()
+		meta.Process(leo, req.Prompt, req.Reply, pulse, shards)
+
 		leo.SomaSnapshot(somaSourceCycle)
 	}
 }
