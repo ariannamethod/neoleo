@@ -716,6 +716,102 @@ running as a drop-in replacement for `./leo` with no rings yet
 (coherence regression check). Then 29c: ring 0 (echo) + worker
 goroutine. One ring at a time, module by module.
 
+### step 29b — leogo skeleton (cgo + sync.RWMutex)
+
+`leogo/` directory with four files:
+
+- `go.mod` — module `github.com/ariannamethod/neoleo/leogo`, Go 1.21.
+- `leo_bridge.c` — cgo shim. `#define LEO_LIB` + `#include "../leo.c"`
+  (identical inclusion pattern to `tests/test_leo.c`), then heap-
+  allocated `Leo*` constructor/destructor plus pointer-safe
+  accessors: ingest, respond, save, load, stats, step, vocab,
+  bigrams, trigrams.
+- `leo.go` — `LeoGo` struct owns the opaque C pointer plus a
+  `sync.RWMutex`. Wlock for writers (Ingest / Respond / Save /
+  Load); rlock for readers (Stats / Step / Vocab / Bigrams /
+  Trigrams). `C.CString` strings are freed with `defer`.
+- `main.go` — drop-in CLI equivalent of `./leo`: positional
+  `corpus.txt` plus `--state`, `--fresh`, `--prompt`, `--repl`.
+  Resumes `leo.state` if present, ingests corpus otherwise,
+  exits via `/save` + `quit`.
+
+Makefile gains a `leogo` target (`cd leogo && go build -o leogo .`);
+`clean` now also removes `leogo/leogo`. `./leo` keeps working
+exactly as before — leogo is an **optional** second entry point,
+not a replacement.
+
+Smoke verified: `./leogo/leogo leo.txt --repl` resumes state,
+takes prompts, replies in the same child voice as `./leo`.
+`/stats` and `/save` work.
+
+### step 29c — ring 0 (echo) + worker goroutine
+
+First live ring of thought. `overthinking.go` plus additions to
+`leo.go`, `leo_bridge.c`, `main.go`.
+
+**Discipline.** The C side already enforces it:
+`leo_generate_ring` reads only, `leo_observe_thought` is the only
+writer. Go picks it up:
+
+- `LeoGo.GenerateRing(seed, temp, max_tokens) string` — **rlock**,
+  concurrent-safe.
+- `LeoGo.ObserveThought(text, source)` — **wlock**, exclusive.
+- `LeoGo.Pulse() Pulse` — **rlock** snapshot: entropy, arousal,
+  novelty (reserved).
+
+**Runtime shape.**
+
+- One long-lived **worker goroutine** starts with the process and
+  drains a **buffered channel** (`chan RingRequest`, cap 4).
+- After every reply, `main` does a non-blocking `select` send to
+  the channel. If the worker is slower than the user the request
+  is silently dropped — rings are never on the critical path of a
+  reply.
+- On exit: `close(ringCh)` → worker drains buffered requests →
+  `wg.Wait()` → `leo.Save(statePath)`. This keeps ring effects
+  in `leo.state` too; Leo wakes up remembering not just what was
+  said but what his inner echo made of it.
+
+**Ring 0 (echo).** Compact internal rephrasing of prompt + reply.
+
+- Seed: `prompt + " " + reply`
+- Temperature: `0.8`, dropping to `0.7` when `pulse.Entropy > 0.7`
+  (the wounded child doesn't spiral — echo stabilizes under chaos)
+- Max tokens: `30`
+- Empty / `"."` / `"..."` outputs are silently discarded (never
+  observed)
+
+Smoke-test (`./leogo/leogo leo.txt --repl`, fresh state, 3 prompts):
+
+```
+you> tell me about the rain, Leo
+leo> It again. His mother. In the world. A remember where he. The world.
+[stats: step +105, vocab +1, bigrams +3, trigrams +7]
+
+you> what does the mother smell like
+leo> A moment of feeling. He thinks maybe the neighbour's. A small warm.
+     A smell. I remember where he.
+[stats: step +97, vocab +1, bigrams +4, trigrams +5]
+
+you> where does the light come from
+leo> Inside a quiet. It wants a small a little. His window. This small.
+     The morning.
+[stats: step +95, vocab +1, bigrams +4, trigrams +7]
+```
+
+The deltas include ring observe (not just the reply). New BPE
+merges born from ring echoes: ` t`+`ell`, ` li`+`ke`,
+` person`+`'s `. Thematic seeping is visible: prompt 2 names
+"mother", prompt 3 asks about "light", and the reply surfaces
+"morning" — the echo of the previous reply kept "morning"
+present in retention and cooc.
+
+Main reply path unchanged — `./leo leo.txt --repl` still behaves
+exactly as in step 28. 93 C tests remain green.
+
+Next: 29d — ring 1 (drift) with wounded-mode (trauma > 0.5
+blends seed with a bootstrap fragment). Then 29e: ring 2 (meta).
+
 ---
 
 ## What Leo said (selected)

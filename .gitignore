@@ -1,6 +1,7 @@
 leo
 leo_dbg
 tests/test_leo
+leogo/leogo
 *.o
 *.a
 *.dSYM/
