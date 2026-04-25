@@ -34,6 +34,7 @@ extern int   leo_bridge_trigrams(void *);
 extern int   leo_bridge_generate_ring(void *, const char *, float, int, char *, int);
 extern void  leo_bridge_observe_thought(void *, const char *, const char *);
 extern void  leo_bridge_pulse(void *, float *, float *, float *);
+extern int   leo_bridge_bootstrap_fragment(void *, char *, int);
 */
 import "C"
 
@@ -200,4 +201,24 @@ func (lg *LeoGo) Pulse() Pulse {
 		Arousal: float32(a),
 		Novelty: float32(n),
 	}
+}
+
+// BootstrapFragment returns a random sentence from the embedded
+// bootstrap (Oleg's dedication to Leo). Read-only — used by ring 1
+// in wounded mode to anchor the drift seed near origin when trauma
+// crosses threshold.
+func (lg *LeoGo) BootstrapFragment() string {
+	out := make([]byte, 512)
+	lg.mu.RLock()
+	C.leo_bridge_bootstrap_fragment(
+		lg.ptr,
+		(*C.char)(unsafe.Pointer(&out[0])), C.int(len(out)),
+	)
+	lg.mu.RUnlock()
+	for i, b := range out {
+		if b == 0 {
+			return string(out[:i])
+		}
+	}
+	return string(out)
 }

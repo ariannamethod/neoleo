@@ -1725,6 +1725,36 @@ static void test_leo_observe_thought_grows_bigrams(void) {
     PASS();
 }
 
+static void test_leo_bootstrap_fragment_returns_sentence(void) {
+    TEST("leo_bootstrap_fragment: returns a sentence from origin");
+    Leo leo;
+    leo_init(&leo);
+    char buf[512];
+    int n = leo_bootstrap_fragment(&leo, buf, sizeof(buf));
+    ASSERT(n > 0, "fragment is non-empty");
+    ASSERT(buf[n - 1] == '.' || buf[n - 1] == '!' || buf[n - 1] == '?',
+           "fragment ends in sentence punctuation");
+    ASSERT(n < (int)sizeof(buf), "fragment fits in buffer");
+    leo_free(&leo);
+    PASS();
+}
+
+static void test_leo_bootstrap_fragment_does_not_mutate_field(void) {
+    TEST("leo_bootstrap_fragment: leaves field unchanged");
+    Leo leo;
+    leo_init(&leo);
+    leo.field.pain = 0.4f;
+    leo.field.trauma = 0.16f;
+    long step_before = leo.step;
+    float trauma_before = leo.field.trauma;
+    char buf[512];
+    leo_bootstrap_fragment(&leo, buf, sizeof(buf));
+    ASSERT(leo.step == step_before, "step unchanged");
+    ASSERT(leo.field.trauma == trauma_before, "trauma unchanged");
+    leo_free(&leo);
+    PASS();
+}
+
 static void test_leo_observe_thought_moves_chambers(void) {
     TEST("leo_observe_thought: chambers shift on anchor-rich thought");
     Leo leo;
@@ -1864,6 +1894,8 @@ int main(void) {
     test_leo_generate_ring_does_not_mutate_field();
     test_leo_observe_thought_grows_bigrams();
     test_leo_observe_thought_moves_chambers();
+    test_leo_bootstrap_fragment_returns_sentence();
+    test_leo_bootstrap_fragment_does_not_mutate_field();
 
     printf("\n=== results: %d passed, %d failed ===\n\n",
            tests_passed, tests_failed);

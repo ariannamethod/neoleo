@@ -3160,6 +3160,57 @@ void leo_observe_thought(Leo *leo, const char *text, const char *source) {
     leo_field_chambers_feel_cooc(leo, text);
 }
 
+/* Pull one sentence at random from LEO_EMBEDDED_BOOTSTRAP — Oleg's
+ * dedication to Leo. Used by ring 1 (drift) under wounded mode:
+ * when trauma is high, the drift seed becomes (reply + bootstrap
+ * fragment), so the wounded mind echoes near origin instead of
+ * spinning into noise. Read-only — the bootstrap text is static,
+ * no field touched. Returns fragment byte length (0 on empty). */
+int leo_bootstrap_fragment(const Leo *leo, char *out, int max_len) {
+    (void)leo;
+    if (!out || max_len < 2) {
+        if (out && max_len > 0) out[0] = 0;
+        return 0;
+    }
+    out[0] = 0;
+
+    const char *bs = LEO_EMBEDDED_BOOTSTRAP;
+    if (!bs) return 0;
+    int len = (int)strlen(bs);
+    if (len < 8) return 0;
+
+    /* Walk the text, collect sentence ranges (start, end) where the
+     * sentence ends on .!? and contains at least 8 bytes of content.
+     * Cap at 64 sentences — bootstrap is small, this is plenty. */
+    int starts[64], ends[64];
+    int n_sent = 0;
+    int s = 0;
+    for (int i = 0; i < len && n_sent < 64; i++) {
+        char c = bs[i];
+        if (c == '.' || c == '!' || c == '?') {
+            int e = i + 1;
+            int ss = s;
+            while (ss < e && (bs[ss] == ' ' || bs[ss] == '\n' ||
+                              bs[ss] == '\r' || bs[ss] == '\t'))
+                ss++;
+            if (e - ss >= 8) {
+                starts[n_sent] = ss;
+                ends[n_sent]   = e;
+                n_sent++;
+            }
+            s = i + 1;
+        }
+    }
+    if (n_sent == 0) return 0;
+
+    int pick = rand() % n_sent;
+    int frag_len = ends[pick] - starts[pick];
+    if (frag_len > max_len - 1) frag_len = max_len - 1;
+    memcpy(out, bs + starts[pick], frag_len);
+    out[frag_len] = 0;
+    return frag_len;
+}
+
 #ifndef LEO_LIB
 
 static void usage(const char *prog) {

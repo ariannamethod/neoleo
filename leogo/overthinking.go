@@ -4,10 +4,10 @@
 // background: compact internal rephrasings that the user never
 // sees, but that slowly change the field from the inside.
 //
-// Step 29c — ring 0 (echo) only.
+// Step 29d — rings 0 and 1.
 //
 //   ring 0  echo    seed = prompt+reply,    temp 0.8 (0.7 if entropy>0.7)
-//   ring 1  drift   → 29d (wounded-aware, seed drifts toward bootstrap)
+//   ring 1  drift   pulse-aware seed, dynamic temp/mode (see runRing1)
 //   ring 2  meta    → 29e (higher temp, shorter)
 //
 // The C side enforces the discipline: leo_generate_ring is
@@ -32,6 +32,51 @@ const (
 	ring0MaxTokens          = 30
 
 	ringChanBufferSize = 4
+)
+
+// Ring 1 (drift) — pulse-aware seed and temperature.
+//
+// The drift ring is the second pass of internal speech. Where
+// echo (ring 0) stabilizes, drift moves sideways through nearby
+// themes. The seed and temperature both depend on Leo's current
+// state at reply time, so the drift "feels" the body it inherits:
+//
+//   wounded (entropy > woundedEntropyThresh):
+//     trauma is high — pull toward origin so the wounded mind
+//     echoes near bootstrap instead of spinning into noise. The
+//     seed becomes (reply + bootstrap_fragment), temp drops, the
+//     semantic gravity rises (effect: tighter contraction).
+//
+//   heated (arousal > heatedArousalThresh):
+//     emotional intensity narrows attention to what Leo just
+//     said. Seed is just the reply — the drift tunnels through
+//     it. Temp slightly above ring 0 default but below default
+//     drift, semantic pull moderate.
+//
+//   default (calm drift):
+//     full context (prompt + reply) with the highest temp the
+//     ring uses. Seed broad, temp permissive — Leo thinks
+//     widely from where the conversation just was.
+//
+//   fresh (novelty > freshNoveltyThresh, reserved):
+//     pulse.Novelty is currently 0 (placeholder); when populated
+//     in a later step, high novelty will pivot the seed onto the
+//     prompt alone — a new stimulus deserves drift starting from
+//     it, not from the reply.
+//
+// All branches share max_tokens = 40; the differentiator is seed
+// shape and temperature.
+const (
+	woundedEntropyThresh float32 = 0.5
+	heatedArousalThresh  float32 = 0.7
+	freshNoveltyThresh   float32 = 0.6
+
+	ring1MaxTokens = 40
+
+	ring1TempWounded float32 = 0.85
+	ring1TempHeated  float32 = 0.95
+	ring1TempDrift   float32 = 1.0
+	ring1TempFresh   float32 = 1.1
 )
 
 // runRing0 generates one echo ring and observes it back into the
@@ -68,13 +113,81 @@ func runRing0(leo *LeoGo, req RingRequest) {
 	leo.ObserveThought(text, "overthinking:ring0")
 }
 
+// runRing1 generates one drift ring with pulse-aware seed and
+// temperature. The pulse is read once at the start (rlock); each
+// branch decides seed/temp/mode without re-touching the field.
+// Then a single read-only generate (rlock) and a single observe
+// (wlock) — same discipline as ring 0.
+func runRing1(leo *LeoGo, req RingRequest) {
+	pulse := leo.Pulse()
+
+	var (
+		seed string
+		temp float32
+		mode string
+	)
+
+	switch {
+	case pulse.Entropy > woundedEntropyThresh:
+		// wounded — anchor drift near bootstrap
+		fragment := leo.BootstrapFragment()
+		if fragment != "" {
+			seed = req.Reply + " " + fragment
+		} else {
+			seed = req.Reply
+		}
+		temp = ring1TempWounded
+		mode = "ring1_wounded"
+
+	case pulse.Arousal > heatedArousalThresh:
+		// heated — tunnel on what was said
+		seed = req.Reply
+		temp = ring1TempHeated
+		mode = "ring1_heated"
+
+	case pulse.Novelty > freshNoveltyThresh:
+		// fresh — pivot onto prompt (reserved branch; pulse.Novelty
+		// is 0 until a later step wires it up)
+		seed = req.Prompt
+		temp = ring1TempFresh
+		mode = "ring1_fresh"
+
+	default:
+		// calm drift — full context
+		if req.Prompt != "" && req.Reply != "" {
+			seed = req.Prompt + " " + req.Reply
+		} else if req.Reply != "" {
+			seed = req.Reply
+		} else {
+			seed = req.Prompt
+		}
+		temp = ring1TempDrift
+		mode = "ring1_drift"
+	}
+
+	if seed == "" {
+		return
+	}
+
+	text := leo.GenerateRing(seed, temp, ring1MaxTokens)
+	switch text {
+	case "", ".", "...":
+		return
+	}
+
+	leo.ObserveThought(text, "overthinking:"+mode)
+}
+
 // workerLoop is the long-lived goroutine that processes ring
-// requests. Receives from ch until it is closed; each request
-// already buffered is processed before exit.
+// requests. Each ring runs sequentially: generate (rlock),
+// observe (wlock), next ring. The rlock and wlock scopes are
+// disjoint, so future parallel-ring rework can opt into shared
+// rlock during generate without changing observe.
 func workerLoop(leo *LeoGo, ch <-chan RingRequest, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for req := range ch {
 		runRing0(leo, req)
+		runRing1(leo, req)
 	}
 }
 

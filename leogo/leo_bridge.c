@@ -106,3 +106,8 @@ void leo_bridge_pulse(void *ptr, float *entropy,
     if (arousal) *arousal = p.arousal;
     if (novelty) *novelty = p.novelty;
 }
+
+int leo_bridge_bootstrap_fragment(void *ptr, char *out, int max_len) {
+    if (!ptr || !out || max_len < 2) return 0;
+    return leo_bootstrap_fragment((const Leo *)ptr, out, max_len);
+}
