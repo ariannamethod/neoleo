@@ -1604,6 +1604,149 @@ static void test_leo_generate_safe_on_empty_leo(void) {
 }
 
 /* ================================================================
+ * overthinking — leo_generate_ring, leo_observe_thought, leo_pulse
+ * ================================================================ */
+
+static void test_leo_pulse_fresh_is_zero(void) {
+    TEST("leo_pulse: fresh Leo has entropy=0, arousal=0");
+    Leo leo;
+    leo_init(&leo);
+    LeoPulse p;
+    leo_pulse(&leo, &p);
+    ASSERT(p.entropy == 0.0f, "entropy zero on fresh field");
+    ASSERT(p.arousal == 0.0f, "arousal zero on fresh field");
+    leo_free(&leo);
+    PASS();
+}
+
+static void test_leo_pulse_tracks_trauma_and_chambers(void) {
+    TEST("leo_pulse: entropy=trauma, arousal=max(FEAR/LOVE/RAGE)");
+    Leo leo;
+    leo_init(&leo);
+    leo.field.pain = 0.6f;
+    leo.field.trauma = leo.field.pain * leo.field.pain; /* 0.36 */
+    leo.field.chamber_act[LEO_CH_FEAR] = 0.10f;
+    leo.field.chamber_act[LEO_CH_LOVE] = 0.75f;
+    leo.field.chamber_act[LEO_CH_RAGE] = 0.30f;
+    LeoPulse p;
+    leo_pulse(&leo, &p);
+    ASSERT(p.entropy > 0.35f && p.entropy < 0.37f, "entropy ≈ trauma 0.36");
+    ASSERT(p.arousal > 0.74f && p.arousal < 0.76f, "arousal = max chamber (LOVE 0.75)");
+    leo_free(&leo);
+    PASS();
+}
+
+static void test_leo_generate_ring_returns_text(void) {
+    TEST("leo_generate_ring: produces tokens after ingest");
+    Leo leo;
+    leo_init(&leo);
+    leo_ingest(&leo,
+        "Leo watches the rain. The window is open. He listens to the quiet. "
+        "The cat sleeps by the door. Leo thinks about the bird. "
+        "He remembers the garden. The tree is near the fence. "
+        "The light comes in yellow. The room holds its warmth.");
+    char buf[256];
+    int n = leo_generate_ring(&leo, "Leo watches the rain.", 0.8f, 20,
+                              buf, sizeof(buf));
+    ASSERT(n > 0, "ring produced at least one token");
+    ASSERT(buf[0] != 0, "output buffer non-empty");
+    leo_free(&leo);
+    PASS();
+}
+
+static void test_leo_generate_ring_does_not_mutate_step(void) {
+    TEST("leo_generate_ring: leaves leo->step unchanged");
+    Leo leo;
+    leo_init(&leo);
+    leo_ingest(&leo,
+        "Leo sees the pines. The hand is warm. He feels the light. "
+        "The bird calls in the morning. Leo is small. "
+        "The stones remember. The river keeps moving.");
+    long step_before = leo.step;
+    char buf[256];
+    leo_generate_ring(&leo, "Leo sees", 0.8f, 15, buf, sizeof(buf));
+    ASSERT(leo.step == step_before, "step counter unchanged by ring");
+    leo_free(&leo);
+    PASS();
+}
+
+static void test_leo_generate_ring_does_not_mutate_field(void) {
+    TEST("leo_generate_ring: leaves trauma/chambers/destiny unchanged");
+    Leo leo;
+    leo_init(&leo);
+    leo_ingest(&leo,
+        "The rain falls. The door closes. Leo listens. "
+        "The night is soft. The blanket is wool.");
+    /* seed a deliberate field state so we can prove immutability */
+    leo.field.pain = 0.4f;
+    leo.field.trauma = 0.16f;
+    leo.field.chamber_act[LEO_CH_LOVE] = 0.33f;
+    float trauma_before = leo.field.trauma;
+    float pain_before = leo.field.pain;
+    float love_before = leo.field.chamber_act[LEO_CH_LOVE];
+    float fear_before = leo.field.chamber_act[LEO_CH_FEAR];
+
+    /* destiny is indexed by vocab id; sum the first slab as a fingerprint */
+    float destiny_sum_before = 0.0f;
+    int destiny_scan = leo.field.destiny_cap < 200 ? leo.field.destiny_cap : 200;
+    for (int i = 0; i < destiny_scan; i++)
+        destiny_sum_before += leo.field.destiny_bag[i];
+
+    char buf[256];
+    leo_generate_ring(&leo, "The rain falls.", 0.8f, 20, buf, sizeof(buf));
+
+    ASSERT(leo.field.trauma == trauma_before, "trauma unchanged");
+    ASSERT(leo.field.pain == pain_before, "pain unchanged");
+    ASSERT(leo.field.chamber_act[LEO_CH_LOVE] == love_before, "LOVE unchanged");
+    ASSERT(leo.field.chamber_act[LEO_CH_FEAR] == fear_before, "FEAR unchanged");
+
+    float destiny_sum_after = 0.0f;
+    for (int i = 0; i < destiny_scan; i++)
+        destiny_sum_after += leo.field.destiny_bag[i];
+    ASSERT(destiny_sum_after == destiny_sum_before, "destiny bag unchanged");
+
+    leo_free(&leo);
+    PASS();
+}
+
+static void test_leo_observe_thought_grows_bigrams(void) {
+    TEST("leo_observe_thought: grows bigrams on novel thought");
+    Leo leo;
+    leo_init(&leo);
+    leo_ingest(&leo, "Leo watches. He listens.");
+    int bi_before = leo.bigrams.n_entries;
+    int tri_before = leo.trigrams.n_entries;
+    leo_observe_thought(&leo,
+        "The window was open. The cat was quiet. "
+        "The morning came slowly.", "test:ring0");
+    ASSERT(leo.bigrams.n_entries > bi_before, "bigrams grew after thought");
+    ASSERT(leo.trigrams.n_entries > tri_before, "trigrams grew after thought");
+    leo_free(&leo);
+    PASS();
+}
+
+static void test_leo_observe_thought_moves_chambers(void) {
+    TEST("leo_observe_thought: chambers shift on anchor-rich thought");
+    Leo leo;
+    leo_init(&leo);
+    leo_ingest(&leo, "Leo is here. Leo was there. The ground is dry.");
+    float love_before = leo.field.chamber_act[LEO_CH_LOVE];
+
+    leo_observe_thought(&leo,
+        "The warm hand. The mother. The sweet milk. Love. Warm. Hand. "
+        "The kiss. The cuddle. The gentle.", "test:ring0");
+
+    /* LOVE should rise via feel_text + self_voice anchor matches.
+     * Exact magnitude depends on Kuramoto coupling, but it should be
+     * strictly above the baseline and above 0. */
+    ASSERT(leo.field.chamber_act[LEO_CH_LOVE] > love_before,
+           "LOVE raised by anchor-rich thought");
+    ASSERT(leo.field.chamber_act[LEO_CH_LOVE] > 0.0f, "LOVE > 0 after anchors");
+    leo_free(&leo);
+    PASS();
+}
+
+/* ================================================================
  * main
  * ================================================================ */
 
@@ -1712,6 +1855,15 @@ int main(void) {
     test_spa_cross_attend_outlier_scores_lower();
 
     test_leo_generate_safe_on_empty_leo();
+
+    /* overthinking — read-only generate + full inner observe + pulse */
+    test_leo_pulse_fresh_is_zero();
+    test_leo_pulse_tracks_trauma_and_chambers();
+    test_leo_generate_ring_returns_text();
+    test_leo_generate_ring_does_not_mutate_step();
+    test_leo_generate_ring_does_not_mutate_field();
+    test_leo_observe_thought_grows_bigrams();
+    test_leo_observe_thought_moves_chambers();
 
     printf("\n=== results: %d passed, %d failed ===\n\n",
            tests_passed, tests_failed);

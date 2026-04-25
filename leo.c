@@ -2946,6 +2946,220 @@ void leo_stats(const Leo *leo) {
     }
 }
 
+/* ================================================================
+ * overthinking support — read-only generate + full inner observe.
+ *
+ * Used by the leogo/ orchestrator for rings-of-thought (echo /
+ * drift / meta) that fire asynchronously after every reply. The
+ * C core remains fully operational without them: if Go is absent,
+ * ./leo never calls these functions and nothing in the reply path
+ * changes.
+ * ================================================================ */
+
+/* Pulse — snapshot of Leo's inner state for ring parameter tuning.
+ * Read once under rlock before spawning ring goroutines, so each
+ * ring decides its own temp / wounded mode without re-touching the
+ * field concurrently. */
+typedef struct {
+    float entropy;   /* trauma (pain²). high = chaos, rings stabilize. */
+    float arousal;   /* max(FEAR, LOVE, RAGE). emotional intensity. */
+    float novelty;   /* reserved — populated in a later step. */
+} LeoPulse;
+
+void leo_pulse(const Leo *leo, LeoPulse *out) {
+    if (!leo || !out) return;
+    const LeoField *f = &leo->field;
+    out->entropy = f->trauma;
+    float a = f->chamber_act[LEO_CH_FEAR];
+    if (f->chamber_act[LEO_CH_LOVE] > a) a = f->chamber_act[LEO_CH_LOVE];
+    if (f->chamber_act[LEO_CH_RAGE] > a) a = f->chamber_act[LEO_CH_RAGE];
+    out->arousal = a;
+    out->novelty = 0.0f;
+}
+
+/* Read-only generation for overthinking rings.
+ *
+ * Same cascade as leo_generate_ex (trigram → bigram → start, temp
+ * schedule, repetition guard, silence-gate #2, sentence cleanup),
+ * but strictly read-only for the Leo field so that several rings
+ * can run concurrently under an RWMutex rlock:
+ *
+ *   - NO leo_field_step     (destiny/pain/retention/prophecy unchanged)
+ *   - NO leo_field_self_voice (chambers unchanged during generation)
+ *   - NO leo->step increment (user-facing counter stays with replies)
+ *
+ * Gravity is NOT installed. The caller (ring worker) guarantees
+ * leo->gravity == NULL at call-time — a ring speaks without a
+ * fresh prompt wrinkle. `seed` is encoded and used as a tail for
+ * leo_choose_continuation; it does not bias via gravity.
+ *
+ * All side effects (lexicon, chambers, trauma, retention, destiny)
+ * are applied afterwards, atomically and exclusively, through
+ * leo_observe_thought on the generated text. */
+int leo_generate_ring(Leo *leo, const char *seed,
+                      float temp, int max_tokens,
+                      char *out, int max_len) {
+    if (!leo || !out || max_len < 2 || max_tokens < 1) {
+        if (out && max_len > 0) out[0] = 0;
+        return 0;
+    }
+    out[0] = 0;
+    if (max_tokens > LEO_GEN_MAX) max_tokens = LEO_GEN_MAX;
+
+    /* encode the seed to drive leo_choose_continuation. The seed
+     * itself never enters cooc/bigram/trigram here — that only
+     * happens in leo_observe_thought, on the ring's own output. */
+    int tail_ids[LEO_GEN_MAX];
+    int n_tail = 0;
+    if (seed && *seed) {
+        int slen = (int)strlen(seed);
+        if (slen > 4096) slen = 4096;
+        n_tail = bpe_encode(&leo->bpe, (const uint8_t *)seed, slen,
+                            tail_ids, LEO_GEN_MAX);
+    }
+
+    int ctx[LEO_GEN_MAX];
+    int n = 0;
+    int start = n_tail > 0 ? leo_choose_continuation(leo, tail_ids, n_tail)
+                           : leo_choose_start(leo);
+    if (start < 0) { out[0] = 0; return 0; }
+    ctx[n++] = start;
+
+    for (int t = 1; t < max_tokens; t++) {
+        int prev1 = ctx[n - 1];
+        int prev2 = n >= 2 ? ctx[n - 2] : -1;
+        float tau = temp * leo_field_temperature_mult(&leo->field);
+        if (tau < 0.1f) tau = 0.1f;
+        int nxt = leo_step_token(leo, prev2, prev1, tau);
+        if (nxt < 0) break;
+
+        /* deliberately NO leo_field_step / leo_field_self_voice here.
+         * Read-only ring discipline: observe is the only writer. */
+
+        if (nxt == prev1) continue;
+        if (n >= 2 && nxt == prev2 && prev1 == ctx[n - 2]) continue;
+        ctx[n++] = nxt;
+
+        if (n >= LEO_GEN_MIN && is_boundary_token(&leo->bpe, nxt)) break;
+
+        /* silence-gate #2 — rings respect trauma/FEAR the same way
+         * the main path does. If the child is hushing in replies,
+         * rings hush early too. */
+        if (n >= LEO_GEN_MIN &&
+            (leo->field.trauma > LEO_SILENCE_TRAUMA_THRESH ||
+             leo->field.chamber_act[LEO_CH_FEAR] > LEO_SILENCE_FEAR_THRESH)) {
+            int last = bpe_token_last_byte(&leo->bpe, nxt);
+            if (last == ' ' || last == '\n' || last == '\r' || last == '\t' ||
+                last == '.' || last == ',' || last == '!' || last == '?' ||
+                last == ';' || last == ':') {
+                break;
+            }
+        }
+    }
+
+    /* decode */
+    int pos = 0;
+    for (int i = 0; i < n; i++) {
+        char buf[LEO_MAX_TOKEN_LEN + 1];
+        int len = bpe_decode_token(&leo->bpe, ctx[i], buf, sizeof(buf));
+        if (pos + len >= max_len - 1) break;
+        memcpy(out + pos, buf, len);
+        pos += len;
+    }
+    out[pos] = 0;
+
+    /* cleanup — same pass as leo_generate_ex so ring text is
+     * shape-clean when fed into observe (capital start, period end). */
+    int lead = 0;
+    while (out[lead] && (out[lead] == ' ' || out[lead] == '\n' ||
+                         out[lead] == '\r' || out[lead] == '\t'))
+        lead++;
+    if (lead > 0) {
+        int rem = (int)strlen(out + lead);
+        memmove(out, out + lead, rem + 1);
+        pos = rem;
+    }
+
+    int last_end = -1;
+    for (int i = pos - 1; i >= 0; i--) {
+        if (out[i] == '.' || out[i] == '!' || out[i] == '?') {
+            last_end = i;
+            break;
+        }
+    }
+    if (last_end >= 0) {
+        out[last_end + 1] = 0;
+        pos = last_end + 1;
+    } else {
+        while (pos > 0 && (out[pos - 1] == ' ' || out[pos - 1] == '\n' ||
+                           out[pos - 1] == '\r' || out[pos - 1] == '\t'))
+            pos--;
+        out[pos] = 0;
+        if (pos > 0 && pos < max_len - 1) {
+            out[pos++] = '.';
+            out[pos] = 0;
+        }
+    }
+
+    for (int i = 0; out[i]; i++) {
+        if (out[i] >= 'a' && out[i] <= 'z') {
+            out[i] = out[i] - ('a' - 'A');
+            break;
+        }
+        if (out[i] >= 'A' && out[i] <= 'Z') break;
+    }
+
+    return n;
+}
+
+/* Full inner echo — apply a thought back to Leo's state atomically.
+ *
+ * The reverse of leo_generate_ring. Where generate is read-only,
+ * observe writes everything:
+ *
+ *   1. lexical growth via leo_ingest (cooc / bigrams / trigrams /
+ *      vocab / step — lexicon hears the thought);
+ *   2. per-token field physics via leo_field_step (destiny, pain,
+ *      retention, prophecy aging — as if each token were emitted);
+ *   3. per-token self-voice via leo_field_self_voice (anchor-matched
+ *      tokens nudge the chambers — body hears itself think);
+ *   4. chambers_feel_text + chambers_feel_cooc on the full thought
+ *      (the mood-shift of thinking this text in one piece).
+ *
+ * Called sequentially under an exclusive wlock by the Go worker,
+ * once per ring, after all rings of a reply-cycle have finished
+ * generating. This keeps each ring's observe atomic and lets
+ * concurrent rings share the field during read-only generation.
+ *
+ * `source` is a tag like "overthinking:ring0" — currently unused
+ * in C, reserved for logging or weight scaling in later steps. */
+void leo_observe_thought(Leo *leo, const char *text, const char *source) {
+    (void)source;
+    if (!leo || !text || !*text) return;
+
+    /* 1. lexicon + cooc + bigrams + trigrams + vocab growth + step. */
+    leo_ingest(leo, text);
+
+    /* 2. per-token field physics + self-voice — the thought "lives
+     * through" Leo as if each token had actually been emitted in a
+     * reply. Mirrors the emission loop of leo_generate_ex. */
+    int ids[LEO_GEN_MAX];
+    int tlen = (int)strlen(text);
+    if (tlen > 4096) tlen = 4096;
+    int n = bpe_encode(&leo->bpe, (const uint8_t *)text, tlen,
+                       ids, LEO_GEN_MAX);
+    for (int i = 0; i < n; i++) {
+        leo_field_step(&leo->field, ids[i], 1.0f);
+        leo_field_self_voice(&leo->field, &leo->bpe, ids[i]);
+    }
+
+    /* 3. chambers feel the full thought — anchor exact/substring
+     * scan plus cooc-inference, identical to what leo_respond does
+     * for an incoming prompt. The thought reaches the body. */
+    leo_field_chambers_feel_text(&leo->field, text);
+    leo_field_chambers_feel_cooc(leo, text);
+}
+
 #ifndef LEO_LIB
 
 static void usage(const char *prog) {

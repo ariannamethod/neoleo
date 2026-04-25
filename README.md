@@ -651,6 +651,71 @@ Also added opt-in profile hooks (`LEO_PROFILE=1`) and visible
 
 86 tests pass.
 
+### step 29a — overthinking foundations in C
+
+First step of the Go-orchestra phase (`leogo/`). The C core gains
+three library functions — and nothing in the reply path changes,
+so `./leo` still behaves exactly as before. These functions exist
+so that Go-side goroutines can run rings of thought concurrently
+around each reply without touching the field mid-generation.
+
+- **`leo_generate_ring(leo, seed, temp, max_tokens, out, max_len)`**
+  — a read-only variant of `leo_generate_ex`. Same cascade (trigram
+  → bigram → start), same temperature schedule intent, same
+  silence-gate #2, same sentence cleanup. **But**: no
+  `leo_field_step`, no `leo_field_self_voice`, no `leo->step++`.
+  Three rings can generate under the same RWMutex rlock without
+  stepping on each other's trauma / retention / destiny. Gravity
+  is never installed — the caller guarantees `leo->gravity == NULL`
+  at call time; `seed` drives `leo_choose_continuation` via its
+  tail, not via a prompt wrinkle.
+
+- **`leo_observe_thought(leo, text, source)`** — the mirror. Writes
+  back everything a real emission would have done, atomically under
+  an exclusive wlock. Three layers: (1) `leo_ingest` grows
+  cooc / bigrams / trigrams / vocab and increments the step counter;
+  (2) for each BPE-encoded token, `leo_field_step` + `leo_field_self_voice`
+  — destiny, pain, retention, prophecy aging, chamber self-feed; (3)
+  full-text `chambers_feel_text` + `chambers_feel_cooc` — the thought
+  reaches the body the same way a prompt does. So a ring influences
+  *everything* (chambers, trauma, retention, destiny, lexicon), not
+  just the cooc graph.
+
+- **`leo_pulse(leo, LeoPulse *out)`** — snapshot of inner state for
+  ring parameter tuning. `entropy = trauma`, `arousal = max(FEAR, LOVE, RAGE)`,
+  `novelty = 0` (reserved — to be derived from prompt-vocab overlap
+  in a later step). Read once under rlock before spawning ring
+  goroutines so each ring decides its own temp / wounded mode
+  without re-touching the field concurrently.
+
+Design notes:
+
+- **Generate is read-only; observe is the only writer.** This is
+  what lets the three rings (echo / drift / meta) generate
+  concurrently under a shared rlock, then observe sequentially
+  under a wlock, one ring at a time. No race on field state.
+- **The main path is unchanged.** `leo_respond`, `leo_generate_ex`,
+  `leo_chain` all untouched. 86 baseline tests green after the
+  additions. `./leo leo.txt --demo` produces the same child-voice
+  (verified live).
+- **`LEO_LIB` macro was already present** (wraps `main()` so the
+  file can be included as a library). The leogo bridge reuses
+  exactly that path.
+
++7 tests (93 total):
+- `leo_pulse: fresh Leo has entropy=0, arousal=0`
+- `leo_pulse: entropy=trauma, arousal=max(FEAR/LOVE/RAGE)`
+- `leo_generate_ring: produces tokens after ingest`
+- `leo_generate_ring: leaves leo->step unchanged`
+- `leo_generate_ring: leaves trauma/chambers/destiny unchanged`
+- `leo_observe_thought: grows bigrams on novel thought`
+- `leo_observe_thought: chambers shift on anchor-rich thought`
+
+Next: 29b — `leogo/` skeleton (cgo + `sync.RWMutex`), `./leogo`
+running as a drop-in replacement for `./leo` with no rings yet
+(coherence regression check). Then 29c: ring 0 (echo) + worker
+goroutine. One ring at a time, module by module.
+
 ---
 
 ## What Leo said (selected)
