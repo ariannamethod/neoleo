@@ -1947,6 +1947,88 @@ static void test_leo_observe_thought_moves_chambers(void) {
 }
 
 /* ================================================================
+ * cross-organ integration tests
+ * ================================================================ */
+
+static void test_leo_state_roundtrip_organisms(void) {
+    TEST("state roundtrip: soma + mathbrain survive save/load");
+    Leo leo;
+    leo_init(&leo);
+    /* drive some state into both organs */
+    leo.field.chamber_act[LEO_CH_LOVE] = 0.55f;
+    leo.field.chamber_act[LEO_CH_FEAR] = 0.20f;
+    leo.field.pain = 0.3f;
+    leo.field.trauma = 0.09f;
+    leo_soma_store(&leo, 0);
+    leo.field.chamber_act[LEO_CH_LOVE] = 0.70f;
+    leo_soma_store(&leo, 0);
+    /* train mathbrain a few steps so weights are no longer pristine */
+    for (int i = 0; i < 30; i++) leo_mathbrain_step(&leo, 0.7f);
+
+    int before_n = leo.field.soma_n;
+    int before_train = leo.field.mathbrain.train_count;
+    float before_w1_0 = leo.field.mathbrain.W1[0];
+    float before_y = leo.field.mathbrain.last_y;
+
+    const char *path = "/tmp/leo_test_state.bin";
+    int saved = leo_save_state(&leo, path);
+    ASSERT(saved, "leo_save_state succeeds");
+    leo_free(&leo);
+
+    Leo leo2;
+    leo_init(&leo2);
+    int loaded = leo_load_state(&leo2, path);
+    ASSERT(loaded, "leo_load_state succeeds");
+
+    ASSERT(leo2.field.soma_n == before_n, "soma_n round-trips");
+    ASSERT(leo2.field.mathbrain.train_count == before_train,
+           "mathbrain train_count round-trips");
+    ASSERT(leo2.field.mathbrain.W1[0] == before_w1_0,
+           "mathbrain W1[0] round-trips byte-exact");
+    /* last_y is recomputed at next forward, not persisted — but we
+     * saved the weights, so a fresh forward on the same field state
+     * should give roughly the same prediction. */
+    leo2.field.chamber_act[LEO_CH_LOVE] = 0.70f;
+    leo2.field.pain = 0.3f;
+    leo2.field.trauma = 0.09f;
+    float y_after = leo_mathbrain_forward(&leo2);
+    float diff = y_after - before_y;
+    if (diff < 0) diff = -diff;
+    ASSERT(diff < 0.5f, "prediction roughly preserved across save/load");
+    leo_free(&leo2);
+    remove(path);
+    PASS();
+}
+
+static void test_leo_mathbrain_features_track_soma(void) {
+    TEST("mathbrain features: soma slots feed inputs 6..17");
+    Leo leo;
+    leo_init(&leo);
+    /* Snapshot 1: love high */
+    leo.field.chamber_act[LEO_CH_LOVE] = 0.8f;
+    leo_soma_store(&leo, 0);
+    /* Snapshot 2: love drops, void rises */
+    leo.field.chamber_act[LEO_CH_LOVE] = 0.2f;
+    leo.field.chamber_act[LEO_CH_VOID] = 0.6f;
+    leo_soma_store(&leo, 0);
+
+    float x[LEO_MB_INPUTS];
+    /* extract via the same path mathbrain_forward uses */
+    leo_mathbrain_forward(&leo);
+    memcpy(x, leo.field.mathbrain.last_features, sizeof(x));
+
+    /* blend (inputs 6..11) should be non-zero across LOVE / VOID */
+    ASSERT(x[6 + LEO_CH_LOVE] > 0.0f, "blend.LOVE non-zero after stores");
+    ASSERT(x[6 + LEO_CH_VOID] > 0.0f, "blend.VOID non-zero after stores");
+    /* velocity (12..17) — LOVE went down, so velocity[LOVE] should be < 0 */
+    ASSERT(x[12 + LEO_CH_LOVE] < 0.0f, "velocity.LOVE negative (LOVE dropped)");
+    /* VOID went up */
+    ASSERT(x[12 + LEO_CH_VOID] > 0.0f, "velocity.VOID positive (VOID rose)");
+    leo_free(&leo);
+    PASS();
+}
+
+/* ================================================================
  * main
  * ================================================================ */
 
@@ -2081,6 +2163,10 @@ int main(void) {
     test_leo_mathbrain_step_decreases_loss();
     test_leo_mathbrain_advisor_overwhelm();
     test_leo_mathbrain_advisor_boredom();
+
+    /* cross-organ integration */
+    test_leo_state_roundtrip_organisms();
+    test_leo_mathbrain_features_track_soma();
 
     printf("\n=== results: %d passed, %d failed ===\n\n",
            tests_passed, tests_failed);
