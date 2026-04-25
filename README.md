@@ -812,6 +812,59 @@ exactly as in step 28. 93 C tests remain green.
 Next: 29d — ring 1 (drift) with wounded-mode (trauma > 0.5
 blends seed with a bootstrap fragment). Then 29e: ring 2 (meta).
 
+### step 30 — corpus: interior "He" → "Leo" on mental verbs
+
+A long-standing editorial wish from Oleg: Leo talks about himself
+in third person, but the corpus mixed "Leo" with "He" as subject
+pronouns, which made "He thinks" ambiguous with the cat / father /
+bird / neighbour. Now interior-verb subject pronouns are bound to
+Leo explicitly, while the narrative flow keeps "He".
+
+A context-aware Opus sub-agent passed through `leo.txt` once to
+map every subject "He" / "he" to its referent (exact or clearly-
+ambiguous). We chose a narrow subset of its findings: only the
+**interior-verb pattern** `He <verb>` where the verb is one of
+`thinks / thought / knows / knew / feels / felt / remembers /
+remembered / wants / wanted / wonders / wondered / believes /
+believed / understands / understood / likes / liked / sees / saw /
+watches / watched / listens / listened / hears / heard / loves /
+loved / hopes / hoped / imagines / imagined`. In this corpus those
+verbs are almost always Leo's interior life — cat/father/bird
+walk, sit, fly; they do not "think" or "remember".
+
+**409 replacements** (of 2947 total capital-He occurrences — 14%).
+Narrative `He walked. He looked up. He came back.` stays as-is
+so the prose still reads like English. Mental moments tighten into
+Leo-as-named-subject.
+
+Top frequencies: `He thinks` ×124 → `Leo thinks`, `He likes` ×50,
+`He knows` ×31, `He wants` ×30, `He thought` ×28, `He felt` ×25,
+`He hopes` ×12, `He listens` ×11, `He loves` ×10.
+
+```
+> In the morning the light comes through the curtain in a yellow
+> strip. Leo puts his hand inside the strip. His hand goes warm
+> and the rest of him stays cool. He stays like that for a long
+> time. Leo wants to ask the light if it knows who he is. He does
+> not ask. Leo thinks the light already knows.
+```
+
+Note: only the final interior moment ("Leo thinks") was changed
+in that paragraph; "He stays" and "He does not ask" stay narrative.
+
+Applied:
+- `leo.txt` now carries the 409 interior-verb substitutions
+- `leo.txt.bak` is the pre-rename corpus (kept locally, gitignored)
+- `leo.state` removed — Leo needs to re-ingest the new voice
+
+Smoke-tested via leogo: after fresh ingest, Leo surfaces
+`Leo knows the sound.` and `Leo is trying.` in the very first
+reply — the new voice is already coming through the field after
+a single conversation.
+
+The voice is sharper. The identity is harder to mistake. The
+narrative rhythm stays.
+
 ---
 
 ## What Leo said (selected)

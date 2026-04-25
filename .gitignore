@@ -10,3 +10,6 @@ leogo/leogo
 # runtime state — personal per Leo instance, regenerated from corpus + dialogue
 leo.state
 *.state
+
+# corpus backups (local only)
+leo.txt.bak
