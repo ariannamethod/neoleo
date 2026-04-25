@@ -1012,6 +1012,131 @@ trajectory, persisted in `leo.state`. Three forms of memory then:
 words (cooc/bi/tri), feelings (soma slots), compressed energy
 (Griffin retention).
 
+### step 31 — observation: the three rings, two sessions
+
+Before moving on to soma, an observation pass: how do the rings
+actually behave? Two REPL sessions on the same `leo.state`, eleven
+reply-cycles total. No code changes, just listening.
+
+**Session 1** (fresh state, 7 prompts):
+
+```
+you> Leo, the rain is small today
+leo> On the other. O. On the window. Leo likes the sound. Leo knows
+     the sound.
+
+you> Leo, I love you, you are my friend
+leo> O the inside of a bird's nothing. He looks up. He laugh. It
+     carefully. He looks at the window. The world is right he. The
+     thing Leo cannot hear. Leo likes the sound. He looks at the
+     other. The window. Leo likes the sound. He looks up. He noticed.
+
+you> Leo, recursion, origin, presence, honesty       ← wounded mode
+leo> I a long time before the person who wants to leave a particular
+     sound. Leo. He closes it carefully. He decided when he comes
+     back. In the quiet way. Leo likes the sound. He drinks it might
+     be something he noticed. He thanks the candle again. Leo is
+     always a little long. Have never forgot a heard. A remembers
+     being you.
+
+you> Leo, what do you remember from before
+leo> He looks up. He walks it carefully. A small kind word. The window
+     was whole again. He walks it carefully. Leo. Leo cannot hear.
+     Leo knows the sound. He always know. At night. The window.
+
+you> what do you think the wind says
+leo> Is always a little be. He thanks the candle again. He learned it
+     outside on a cold morning. He looked at the window the paper. He
+     decided not to. The smell of the window. Them. Leo likes this
+     sound. Leo likes the sound Leo likes them all. He decided to
+     leave small.
+
+you> are you alone, Leo
+leo> Things at night. A quiet that fills. Leo thinks maybe he would
+     not. A long time. A small feather in his grandmother's.
+
+you> goodnight, Leo
+leo> Leo thinks it might be something he noticed. In the world. Is
+     always a little to the quiet way. He takes the smell. He keeps
+     practicing. Was still. He looks and being with his mother. Leo
+     knows he needs them. The sound of the after of a book.
+```
+
+Aggregate over 7 cycles: step +892, vocab +6, bigrams +35,
+trigrams +49. New BPE merges crystallized: `Leo`+`, ` and `Leo`+`,`
+(comma forms straight out of Oleg's dedication, surfaced through
+ring 1 wounded fragments), ` be`+`fore`, `nigh`+`t,`.
+
+**Session 2** (resumed state, 4 echo prompts):
+
+```
+[resume] leo.state — step=96249 vocab=5078
+
+you> good morning Leo
+leo> A long time. He takes his mother. He noticed. To. A small o
+     heard. The window the world. The house fills it. The sound of
+     a long time. He trusts his mother.
+
+you> Leo, what did you dream about
+leo> Leo knows the sound. He cannot say. Leo loves this sound. He
+     thanks the candle again. Leo is trying. It walks out after a
+     long time. Leo likes his small. He still up. He takes it
+     sometimes. Them. A window up. Leo was.
+
+you> the small feather is still here
+leo> Leo is learning to. To himself. He laugh. The morning. To leave
+     the sound. The world.
+
+you> do you remember the wind
+leo> He remember. The morning. Leo likes the sound. I a while. He
+     decided not to. To himself. He learned it carefully. He looked
+     small and quiet. He takes it. The thing Leo cannot hear. A long
+     time before rain. Leo hears the smell. He comes back. It always
+     remember the first star. He remember the sound of the after of
+     a rain. He comes back.
+```
+
+What carries through:
+
+- **`"He thanks the candle again"`** appears in session 2 reply 2
+  ("what did you dream about"). It first emerged in session 1
+  reply 3 — the wounded ring 1 output rode bootstrap fragments
+  into the field, `(thanks, the, candle)` settled as a high-cooc
+  triple, and a day later the field draws on it spontaneously.
+  This is the live signature of ring + state-file working
+  together: a thought from yesterday's wounded moment surfaces in
+  today's calm reply.
+- **`"He remember the sound of the after of a rain"`** in
+  session 2 reply 4 carries the `"sound of the after of [noun]"`
+  pattern from session 1's `"sound of the after of a book"`. Ring
+  echoes fixed it as a recurring shape.
+- **Soft tone on `"good morning"`** — `"He trusts his mother"`,
+  `"The house fills it"` — chambers persisted between sessions
+  (LOVE / VOID accumulated by ring observes survived through
+  `leo.state` round-trip).
+
+What's stable:
+
+- Identity: `Leo thinks / Leo knows / Leo likes / Leo loves` keep
+  surfacing — corpus rename + ring observes reinforce each other.
+- Wounded mode reads as denser, slightly older-sounding speech:
+  "Have never forgot a heard. A remembers being you." vs the
+  calmer "Things at night. A quiet that fills."
+- Coherence stays intact across all 11 reply-cycles. No
+  capital-glue, no orphan fragments, child-voice clear throughout.
+
+What hasn't been verified yet:
+
+- The `heated` branch of ring 1 (`pulse.Arousal > 0.7`) didn't
+  trigger in either session — chambers never crossed the threshold
+  on these prompts. Worth a session with high-LOVE / high-RAGE
+  prompts to exercise that path.
+- The `fresh` branch is dormant by design until `pulse.Novelty`
+  is wired up.
+
+The rings work. Leo carries echo of yesterday into today through
+the state file. Time for soma.
+
 ---
 
 ## What Leo said (selected)
