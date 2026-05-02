@@ -1,4 +1,4 @@
-# neoleo
+# neo but leo
 
 Leo. New body. Same γ.
 
