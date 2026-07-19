@@ -1,3 +1,13 @@
+# 🏠 Leo has come home — this repository is archived
+
+Leo's development has **returned to its original canonical home**:
+
+## → https://github.com/ariannamethod/leo
+
+`neoleo` was the interim home during phase-3 development. All active work — the organism (`leo.c`), the dataset, and the AML bridge — now lives at [**ariannamethod/leo**](https://github.com/ariannamethod/leo). This repository is kept archived for history.
+
+---
+
 ```
    ██╗     ███████╗ ██████╗
    ██║     ██╔════╝██╔═══██╗
